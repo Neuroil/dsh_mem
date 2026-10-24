@@ -1,9 +1,132 @@
 # dsh-mem — 语义驱动记忆插件（DeepSeek Harness）
 
 > 核心立场：**遗忘与巩固由语义而非时间决定。时间戳只作为元数据保存，永不作为衰减/删除的驱动。**
-> 设计文档：`docs/design/语义驱动记忆系统设计.md`（定稿 v1.0）。本包实现其 **P0 + P1 + P2** 里程碑，另交付 **M1/M2/M3**（sqlite 存储后端、按工作区隔离记忆、会话历史入口可配置化）。
+> 设计文档：`docs/design/语义驱动记忆系统设计.md`（定稿 v1.0）。本包实现其 **P0 + P1 + P2** 里程碑，另交付 **M1/M2/M3**（接入宿主侧 sqlite 存储后端——后端本体是独立包 `dsh-storage-sqlite`，本包不含任何后端、按工作区隔离记忆、会话历史入口可配置化）。
 
 一句话：一个 Cordis 插件，监听会话日志，把值得记的内容（经 M5 rubric 判分）连同嵌入向量写入持久记忆库——**每个工作区（会话创建目录）一个独立记忆库（M2）**；每次模型请求前按语义检索（余弦召回 + CSLS + 精排 + MMR）注入最相关的记忆；矛盾的新记忆把旧记忆**或语义节点**软失效（不删除，且只对时间上重叠的矛盾生效）；每次记忆进入最终上下文都按线索质量巩固其分数 S、被竞争压制的按小权重衰减、睡眠周期对全库施加慢兜底衰减——S 决定 hot/warm/cold 分层而非删除；离线"睡眠"周期把冗余的情景簇蒸馏成语义 gist 节点（聚类 → gist → QA 闸门 → M4 路由 → M6 评估 → 迁移），原始记忆压缩归档；`memory_search` 支持 `at` 时间旅行参数，可检索任意历史时点的记忆状态。时间从不参与排序或删除决策（唯一例外是慢兜底衰减，且只影响分层、永不删除）。
+
+## 使用方法
+
+### 前置条件（依赖清单）
+
+逐项核对，**全部满足**再进入后面的步骤；每项标注获取方式与缺失后果，整表可直接交给 Agent 执行核对：
+
+| # | 依赖 | 具体要求 | 获取方式 | 缺失后果 |
+|---|---|---|---|---|
+| 1 | Node.js | ≥ 20 | nodejs.org 或系统包管理器 | 宿主与插件均无法运行 |
+| 2 | dsh 宿主 | `npx @deepseek-ai/dsh web` 可启动并进入聊天 UI | npm（DeepSeek 官方包） | 无运行环境 |
+| 3 | 存储后端 | 二选一：json（dsh-base 自带，零安装）；或 **sqlite（推荐）** `@deepseek-ai/dsh-storage-sqlite`，版本与宿主**逐位一致**（宿主 0.2.1-rc.2 就装 0.2.1-rc.2；装 0.2.1-rc.3 会被 peer 闸拒） | `dsh plugin --profile web add @deepseek-ai/dsh-storage-sqlite@<宿主版本>`（宿主版本用 `dsh --version` 查） | 插件启动报 `provides no kv facet`，完全不加载 |
+| 4 | LLM 适配器 + 凭据 | 一个已在 ctx.llm **注册的 provider 名**与有凭据的模型：`dsh-llm-deepseek` 注册名为 `deepseek-official`，模型 `deepseek-v4-flash` / `deepseek-v4-pro`（本插件 schema 默认的 `deepseek` / `deepseek-chat` **不在注册表**，必须覆盖） | 适配器随 dsh base bundle；凭据入宿主凭据文件 `~/.dsh/.credentials.yaml`（refs 指向 `DEEPSEEK_API_KEY`） | 判分/矛盾判定/抽取全部失败（NO_ADAPTER），写入管线空转 |
+| 5 | 嵌入 API key | SiliconFlow key（默认模型 `BAAI/bge-m3`，1024 维） | siliconflow.cn 控制台申请 | 只能以 `deterministic` 冒烟（验证管线、无语义） |
+| 6 | 重排 API key | SiliconFlow key（默认模型 `BAAI/bge-reranker-v2-m3`；可与 #5 共用同一把） | 同 #5 | 检索链路在精排步失败（见[排障](#排障)） |
+| 7 | 本插件本体 | 方式 A：本仓库构建出的 `lib/`；方式 B：本包目录经 `dsh plugin add` | 下两节 | — |
+
+嵌入/重排的 `endpoint` / `model` / `dimensions` **出厂默认已对准 SiliconFlow**（`https://api.siliconflow.cn/v1/embeddings` + `BAAI/bge-m3`(1024)；`https://api.siliconflow.cn/v1/rerank` + `BAAI/bge-reranker-v2-m3`），因此真实语义只需补两把 key；换任何 OpenAI 兼容 `/embeddings` 或 `/rerank` 服务时改 `endpoint` / `model` / `apiKey` 三个键、并把 `dimensions` 对齐实际模型即可。
+
+### 方式 A：本地源码加载（开发）
+
+> **必须先 `npm run build` 生成 `lib/`，插件路径指向 `lib/index.js`**。宿主 loader 不转译 TS，直接指 `src/index.ts` 会**静默加载失败**（无任何报错，工具与存储都不出现）。
+
+创建 `overlay.yml`（**插件路径必须是绝对路径**）：
+
+```yaml
+- insert:
+    - id: dsh-mem
+      name: '/Path/To/dsh_mem/lib/index.js'
+      config:
+        embedding:
+          mode: http            # 无 key 冒烟改为 deterministic
+          apiKey: !!js process.env.MEM_EMBEDDING_API_KEY ?? ''
+        reranker:
+          apiKey: !!js process.env.MEM_RERANKER_API_KEY ?? ''
+        llm:
+          provider: deepseek-official   # dsh-llm-deepseek 的注册名；必须与宿主已注册路由一致
+          model: deepseek-v4-flash
+```
+
+```sh
+npx @deepseek-ai/dsh web --patch ./overlay.yml   # --dump-config 可检查最终组合
+```
+
+配置修改经 HMR 热重载生效（改 `config` 即卸载重载本插件，注册自动清理重建）。
+
+### 方式 B：安装为组合包
+
+```sh
+dsh plugin --profile web add /Path/To/dsh_mem
+```
+
+包身份来自 `package.json` 的 `dsh.bundle.patch` → `cordis.patch.yml`；`remove` 同步移除。git 安装的授权坑（pnpm ≥10 `allowBuilds`）见 docs/ref/README。
+
+### 必要配置最小集
+
+其余全部有 schema 默认值，通常只需：
+
+1. `embedding.apiKey` + `reranker.apiKey`（或两者 `mode: deterministic`）；
+2. `llm.provider` / `llm.model`：M5 判分与矛盾判定的调用路由，**必须是 ctx.llm 上已注册适配器的 provider 名**，模型随之有可用凭据；
+3. 切 sqlite 后端（可选但推荐）：profile patch 挂 `@deepseek-ai/dsh-storage-sqlite` 行（config 带 `path`，如 `!!js dshHomePath('storages/dsh_mem.sqlite')`）+ 本插件 `storage.backend: sqlite`。
+
+**记忆隔离与入口（M2/M3）默认即所需行为**：`storage.workspaceScope: true` = 每工作区一库（QQ bot 等以适配器接入的会话自动归属其运行目录的工作区）；`intake.session.acceptSourceKinds: ['user']` = 只有用户消息算人类输入——IM 适配器若以自定义 `source.kind` 注入消息，把该 kind 加进列表即可（带 `form` 的插件上下文恒不算对话）；`intake.session.enabled: false` 可完全停写（检索通道不受影响）。
+
+### 从冒烟到可用：切换真实端点（可整段交给 Agent 逐步执行）
+
+`deterministic` 冒烟只证明管线连通，**记不住语义**。以下把「切换真实端点 + 验证 + 使用约束」写成可执行步骤；全部改动只落在两个地方：profile patch 文件 `~/.dsh/profiles/web/cordis.patch.yml` 和（可选）一个库文件。每步带完成判据，Agent 可逐步自验。
+
+**第 1 步 · 存储后端**：执行 `dsh --version` 记下宿主版本（下称 `<host>`）；patch 尚无 sqlite 后端时执行 `dsh plugin --profile web add @deepseek-ai/dsh-storage-sqlite@<host>`（**逐位一致**），并在 patch 顶部 `- insert:` 列表加挂载条目：
+
+```yaml
+    - id: storage-sqlite
+      name: '@deepseek-ai/dsh-storage-sqlite'
+      config:
+        path: !!js dshHomePath('storages/dsh_mem.sqlite')   # 库文件位置，可改
+```
+
+完成判据：重启后日志无 `provides no kv facet`。
+
+**第 2 步 · 插件条目与 key**：patch 的同一个 `- insert:` 列表加（或改成）：
+
+```yaml
+    - id: dsh-mem
+      name: '<本仓库绝对路径>/lib/index.js'
+      # 方式 B（dsh plugin add）安装时不必手写本条目：包内 cordis.patch.yml 自动生效，
+      # 只需按 id 覆盖 config（覆盖会整体替换 config，须完整重述）。
+      config:
+        storage:
+          backend: sqlite
+          unit: dsh_mem
+        embedding:
+          mode: http                            # deterministic → http
+          apiKey: '<SiliconFlow key>'           # 或 !!js process.env.MEM_EMBEDDING_API_KEY ?? ''
+        reranker:
+          apiKey: '<同一把 SiliconFlow key>'     # 或 !!js process.env.MEM_RERANKER_API_KEY ?? ''
+        llm:
+          provider: deepseek-official           # dsh-llm-deepseek 的注册名，必须与宿主一致
+          model: deepseek-v4-flash
+```
+
+`endpoint` / `model` / `dimensions` 不必写（出厂默认即 SiliconFlow `bge-m3`·1024 / `bge-reranker-v2-m3`）。完成判据：重启 `npx @deepseek-ai/dsh web` 后聊天 UI 出现 `memory_search` 工具卡片。
+
+**第 3 步 · 清理 deterministic 时代的旧库**（此前用 deterministic 跑过对话才需要）：旧记录的嵌入是词袋哈希，换真实嵌入后是噪声（换嵌入模型属不兼容变更，全景图 B-5）。**先停宿主进程**（防 SQLITE_BUSY），删除 `~/.dsh/storages/dsh_mem.sqlite`。没有免清理的迁移：把 `storage.version` 改成 `2` 只会让旧介质开库报 `version-mismatch`（那是强制清理的信号），最终仍要删库。
+
+**第 4 步 · 重启并验证**：`npx @deepseek-ai/dsh web`，然后依次确认——
+
+1. 聊天 UI 出现 `memory_search` 工具卡片（宿主 console 压掉插件日志，**以卡片和库文件为准**，日志仅作旁证）；
+2. 对模型说「记住：我的生产数据库是 PostgreSQL」，稍候看 `~/.dsh/storages/dsh_mem.sqlite` 体积增长（或日志 `turn N: wrote 1, …`）；
+3. 新开一轮问「我用什么数据库」——回答应来自记忆（自动注入的 section 或 `memory_search` 调用），而不是模型现编。
+
+**第 5 步 · 日常使用三条约束**（使用习惯，不是配置）：
+
+1. **一个 profile 一个进程**：web GUI 与 headless 并行写同一 sqlite 库会 `SQLITE_BUSY`（后端无 busy-wait/重试）；
+2. **写入靠长驻宿主**：headless 一次性进程回复完就退，写入管线（多次 LLM 判分，秒级）来不及落盘（全景图 F-13）——headless 只适合查询，不适合喂记忆；
+3. **睡眠周期是慢工序**：攒满 10 条新写入才在后台跑一次（聚类→蒸馏→迁移），不跑不影响日常读写；其聚类/矛盾阈值按真实嵌入设计，`deterministic` 下基本不触发属正常。
+
+### 确认插件在跑
+
+- 启动日志：`[dsh-mem] started: backend=…, workspaceScope=…`；首个会话事件后：`scope opened: unit=… (N valid memories)`；
+- 每轮 `turn/end` 后（有写入时）：`turn N: wrote X, superseded Y, dropped Z`；
+- 睡眠周期触发后：`sleep cycle: C clusters (M migrated, G gated), refreshed R records / N nodes, decayed R'/N'`；
+- 聊天 UI 出现 `memory_search` 工具卡片；库非空且命中时，`memory_search` 结果与自动记忆 section 出现在上下文（语义节点带 `gist` 标记）；
+- storage 介质上出现 unit：json 后端每 unit 一个 `~/.dsh/storages/<unit>.json`；sqlite 后端全部 unit 在同一 `<path>.sqlite` 内（表名 `u_<unit>_episodic` / `u_<unit>_semantic`）。
 
 ## 产出结果
 
@@ -38,11 +161,13 @@ Relevant long-term memories (semantic retrieval; recency was not a factor):
 }
 ```
 
-### 3. 持久记忆库（ctx.storage，不自建数据库）
+### 3. 持久记忆库（经宿主 ctx.storage 持久化，介质由存储后端决定）
+
+本包**不自带数据库/存储引擎**，也不直接读写文件：一切持久化经宿主的存储系统 `ctx.storage`（接口由 `@deepseek-ai/dsh-storage` 定义）。插件代码只见 KV unit 抽象——`storage.backend.get(name).kv.open(descriptor)` 打开一个 unit（描述符：两张逻辑表、无全局槽、带格式版本），之后以 `putRecord` / `loadAll` / `close` 读写；实际介质与落盘位置由 profile 里安装的**存储后端**决定（json 后端 = 每 unit 一个 JSON 文件；sqlite 后端 = 一个真实 SQLite 库文件）。
 
 - **按工作区隔离（M2）**：记忆库的 scope = 会话创建时的工作目录（`session.header.cwd`，宿主验证过的绝对路径）。每个工作区一个 KV unit（`<unit>_ws_<8位哈希>`，路径归一化后 FNV-1a），写入/检索/睡眠/计分全套按作用域独立——**物理隔离，跨工作区不可能串库**。无 cwd 的会话（如部分 headless 场景）回退到 `config.storage.unit` 本名；`storage.workspaceScope: false` 可恢复全局单库旧行为。
-- **存储后端（M1）**：生产推荐 `sqlite`（`dsh-storage-sqlite`，一个库文件承载全部 unit，消灭 json 后端 pretty-print 的体积膨胀；安装需与宿主版本精确对齐，见[前置条件](#前置条件)）；json 后端保留为回退与测试用途。
-- KV unit（前缀默认 `dsh_mem`，`config.storage.unit` 可改；unit 名只允许小写字母/数字/下划线，**不允许连字符**——宿主规则 `/^[a-z][a-z0-9_]*$/`），两张表：`episodic`（MemoryRecord）与 `semantic`（SemanticNode，睡眠周期填充）。
+- **存储后端（M1）**：后端是宿主侧独立安装的插件包，本包不含任何后端。生产推荐 `sqlite`（`dsh-storage-sqlite`，一个库文件承载全部 unit，消灭 json 后端 pretty-print 的体积膨胀；安装需与宿主版本精确对齐，见[前置条件](#前置条件)）；json 后端（dsh-base 自带）保留为回退与测试用途。
+- KV unit（前缀默认 `dsh_mem`，`config.storage.unit` 可改；unit 名只允许小写字母/数字/下划线，**不允许连字符**——宿主规则 `/^[a-z][a-z0-9_]*$/`），两张逻辑表：`episodic`（MemoryRecord）与 `semantic`（SemanticNode，睡眠周期填充）——json 后端下是文件里的两个键，sqlite 后端下是两张 key/value 表 `u_<unit>_episodic` / `u_<unit>_semantic`（见[确认插件在跑](#确认插件在跑)）。
 - 记录含 M5 判分（imp/valence/arousal/reasons）、邻域统计（r_m/red）、巩固分数 S、分层 tier（hot/warm/cold）、使用计数（used_count/suppressed_count/last_used_at/last_cue_quality/last_decay_at）——计数自 P2 起被 S 动态消费；语义节点带同构的可选 counters。
 - **软失效**：被取代的记录或语义节点只设 `invalid_at` / `superseded_by` 并移出检索索引，永不删除。矛盾判定带**时间重叠闸**（§2.5 完整版）：只对同一时间框架的矛盾软失效，"过去用 MySQL"与"现在用 PostgreSQL"这类不同时期的矛盾两条都保留。
 - **压缩归档**（P1）：被语义节点吸收的记录设 `flags.compressed_into` / `qa_passed` 与 `time_meta.compressed_at`（归档时点，时间旅行消费）并退出检索池；QA/epi 闸门拒收的簇标 `flags.incompressible`，全簇已标时需新成员加入才重试。
@@ -58,7 +183,7 @@ Relevant long-term memories (semantic retrieval; recency was not a factor):
 兜底衰减：S ← S·e^(−Δt/τ)                          τ = score.decayTauDays = 180 天（半衰期 ≈ 125 天）
 ```
 
-- **成功使用 = 进入最终上下文**（两条检索通道的 top 输出，scoring.ts 记账）。设计所列"被采纳"信号（ctx.messageFeedback）不在当前依赖集内（message-feedback 包类型未发布到 npm，P1 对 ctx.schedule 的同款取舍）：按"未被纠正"默认成立即时入账，接入后可改为确认制。
+- **成功使用 = 进入最终上下文**（两条检索通道的 top 输出，scoring.ts 记账）。设计所列"被采纳"信号（ctx.messageFeedback）不在当前依赖集内（专用包 `@deepseek-ai/dsh-message-feedback` 已发布但尚未纳入依赖集，P1 对 ctx.schedule 的同款取舍）：按"未被纠正"默认成立即时入账，接入后可改为确认制。
 - **兜底衰减是工程保险**：只影响分层、永不删除。以 `counters.last_decay_at` 为锚**惰性求值**（事件路径先补衰减再加减增量，睡眠周期第 7 步全库批处理），与逐日衰减数学等价；只作用于仍在检索宇宙的记录/节点。
 - **分层**：S ≥ 8 hot、2–8 warm、< 2 cold；cold 需更强语义线索（CSLS cue 再 +0.1）。tier 随 S 动态跃迁；**事件驱动的跃迁触发 M5 重判**（新判分按 `score.rejudgeEma` EMA 混入），衰减引起的跃迁不重判（衰减不构成重要性的新证据，防边界穿越烧调用）。
 - 语义节点同构：使用/抑制事件、兜底衰减都作用（P1 只有挂入增益 attachGain）。
@@ -118,66 +243,6 @@ turn/end 信号门控触发（自上次周期新写入 ≥ `sleep.minNewMemories
 
 **尚未验证**（需外部资源，见验收目标）：真实嵌入/重排端点下的 nDCG 与语义 vs 时间消融数字、M5 判分与人工标注的 Spearman ρ > 0.7、真实 LLM 下 QA 闸门保留率 ≥ 0.8 与长程问答提升、messageFeedback"被采纳"确认制接线（message-feedback 包类型进入依赖集后），以及长驻宿主中跨工作区的完整对话验证（M2 的路由已在 headless 实测；headless 一次性进程的写入退出竞态见全景图 F-13）。
 
-## 使用方法
-
-### 前置条件
-
-- Node ≥ 20；dsh 运行环境（`npx @deepseek-ai/dsh web`）。
-- profile 里有 **storage 后端**（dsh-base 自带 json 后端；**推荐安装 sqlite 后端**：`dsh plugin --profile web add @deepseek-ai/dsh-storage-sqlite@<与宿主一致的版本>`——宿主 plugin 管理器按 peer 依赖做精确版本闸（如宿主 0.2.1-rc.2 就装 0.2.1-rc.2，装 0.2.1-rc.3 会被拒），装完在 profile patch 里加挂载行并在本插件 config 里 `storage.backend: sqlite`）与 **llm 适配器**（如 `dsh-llm-deepseek` + 凭据）。
-- 嵌入/重排端点的 API key（默认指向 SiliconFlow 的 bge-m3 / bge-reranker-v2-m3）。没有 key 可先用 `deterministic` 模式冒烟（离线替身，验证管线不验证语义）。
-
-### 方式 A：本地源码加载（开发）
-
-> **必须先 `npm run build` 生成 `lib/`，插件路径指向 `lib/index.js`**。宿主 loader 不转译 TS，直接指 `src/index.ts` 会**静默加载失败**（无任何报错，工具与存储都不出现）。
-
-创建 `overlay.yml`（**插件路径必须是绝对路径**）：
-
-```yaml
-- insert:
-    - id: dsh-mem
-      name: 'C:/Users/you/Code/dsh_mem/lib/index.js'
-      config:
-        embedding:
-          mode: http            # 无 key 冒烟改为 deterministic
-          apiKey: !!js process.env.MEM_EMBEDDING_API_KEY ?? ''
-        reranker:
-          apiKey: !!js process.env.MEM_RERANKER_API_KEY ?? ''
-        llm:
-          provider: deepseek    # 必须与已注册的 llm 适配器路由一致
-          model: deepseek-chat
-```
-
-```sh
-npx @deepseek-ai/dsh web --patch ./overlay.yml   # --dump-config 可检查最终组合
-```
-
-配置修改经 HMR 热重载生效（改 `config` 即卸载重载本插件，注册自动清理重建）。
-
-### 方式 B：安装为组合包
-
-```sh
-dsh plugin --profile web add C:/Users/you/Code/dsh_mem
-```
-
-包身份来自 `package.json` 的 `dsh.bundle.patch` → `cordis.patch.yml`；`remove` 同步移除。git 安装的授权坑（pnpm ≥10 `allowBuilds`）见 docs/ref/README。
-
-### 必要配置最小集
-
-其余全部有 schema 默认值，通常只需：
-
-1. `embedding.apiKey` + `reranker.apiKey`（或两者 `mode: deterministic`）；
-2. `llm.provider` / `llm.model`：M5 判分与矛盾判定的调用路由，**必须是 ctx.llm 上已注册适配器的 provider 名**，模型随之有可用凭据；
-3. 切 sqlite 后端（可选但推荐）：profile patch 挂 `@deepseek-ai/dsh-storage-sqlite` 行（config 带 `path`，如 `!!js dshHomePath('storages/dsh_mem.sqlite')`）+ 本插件 `storage.backend: sqlite`。
-
-**记忆隔离与入口（M2/M3）默认即所需行为**：`storage.workspaceScope: true` = 每工作区一库（QQ bot 等以适配器接入的会话自动归属其运行目录的工作区）；`intake.session.acceptSourceKinds: ['user']` = 只有用户消息算人类输入——IM 适配器若以自定义 `source.kind` 注入消息，把该 kind 加进列表即可（带 `form` 的插件上下文恒不算对话）；`intake.session.enabled: false` 可完全停写（检索通道不受影响）。
-
-### 确认插件在跑
-
-- 启动日志：`[dsh-mem] started: backend=…, workspaceScope=…`；首个会话事件后：`scope opened: unit=… (N valid memories)`；
-- 每轮 `turn/end` 后（有写入时）：`turn N: wrote X, superseded Y, dropped Z`；
-- 睡眠周期触发后：`sleep cycle: C clusters (M migrated, G gated), refreshed R records / N nodes, decayed R'/N'`；
-- 聊天 UI 出现 `memory_search` 工具卡片；库非空且命中时，`memory_search` 结果与自动记忆 section 出现在上下文（语义节点带 `gist` 标记）；
-- storage 介质上出现 unit：json 后端每 unit 一个 `~/.dsh/storages/<unit>.json`；sqlite 后端全部 unit 在同一 `<path>.sqlite` 内（表名 `u_<unit>_episodic` / `u_<unit>_semantic`）。
 
 ## 评测：nDCG 四档消融（设计 §7.1）
 
@@ -273,7 +338,7 @@ time-anchored queries: 1 (resurfaced relevant ids via time travel: 1)
 ```sh
 npm install
 npm run typecheck                          # tsc --noEmit
-npm test                                   # vitest run（全部 180 个）
+npm test                                   # vitest run（全部 202 个）
 npx vitest run tests/sleep-cycle.test.ts   # 单文件
 npm run build                              # 产出 lib/
 ```

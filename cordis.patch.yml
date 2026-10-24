@@ -17,5 +17,7 @@
       model: BAAI/bge-reranker-v2-m3
       apiKey: !!js process.env.MEM_RERANKER_API_KEY ?? ''
     llm:
-      provider: deepseek
-      model: deepseek-chat
+      # 必须是宿主 ctx.llm 已注册的路由名：dsh-llm-deepseek 注册为 deepseek-official，
+      # 模型目录 deepseek-v4-flash / deepseek-v4-pro。schema 默认值 deepseek/deepseek-chat 不在注册表。
+      provider: deepseek-official
+      model: deepseek-v4-flash
