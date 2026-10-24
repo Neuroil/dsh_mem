@@ -117,6 +117,20 @@ export interface ToolConfig {
   maxResults: number
 }
 
+/** 会话历史入口（M3）：对话历史的来源与"什么算人类输入"由配置决定。 */
+export interface IntakeConfig {
+  session: {
+    /** dsh 会话事件入口总开关：false = 完全停写（检索通道不受影响）。 */
+    enabled: boolean
+    /**
+     * 哪些 `source.kind` 的 user 消息算人类对话（默认仅 'user'）。IM 适配器
+     * 以自定义 kind 注入消息时把该 kind 加进此列表即可；带 `form` 的消息
+     * （插件上下文）恒不算对话（intake.ts 守卫）。
+     */
+    acceptSourceKinds: string[]
+  }
+}
+
 export interface StorageConfig {
   /** Backend name registered on ctx.storage (`json` / `sqlite`). */
   backend: string
@@ -144,6 +158,7 @@ export interface Config {
   sleep: SleepConfig
   section: SectionConfig
   tool: ToolConfig
+  intake: IntakeConfig
 }
 
 const httpModel = (defaults: { endpoint: string; model: string; timeoutMs: number }) =>
@@ -299,4 +314,12 @@ export const Config: Schema<Config> = Schema.object({
     enabled: Schema.boolean().default(true),
     maxResults: Schema.natural().min(1).default(5),
   }).default({ enabled: true, maxResults: 5 }),
+
+  // 会话历史入口（M3）：见 IntakeConfig 注释
+  intake: Schema.object({
+    session: Schema.object({
+      enabled: Schema.boolean().default(true),
+      acceptSourceKinds: Schema.array(Schema.string()).default(['user']),
+    }).default({ enabled: true, acceptSourceKinds: ['user'] }),
+  }).default({ session: { enabled: true, acceptSourceKinds: ['user'] } }),
 })

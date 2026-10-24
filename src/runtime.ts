@@ -25,6 +25,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 // 拉入 system-prompt 包的声明合并，使 'system-prompt/assemble' 事件可类型化
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { createEmbeddingProvider, createRerankerProvider } from './embedding.js'
+import { isConversationMessage } from './intake.js'
 import type { TurnMessage } from './judges.js'
 import { CordisLlm } from './llm.js'
 import { MemoryStore, memoryUnitDescriptor } from './memory-store.js'
@@ -49,11 +50,6 @@ export function messageText(message: Message): string {
 
 /** Render retrieval winners as a prompt-section block (design §5.2). */
 export { formatMemories }
-
-/** Only genuine human prompts become memories; injected/plugin contexts do not. */
-function isHumanPrompt(message: Message): boolean {
-  return message.role === 'assistant' || message.source.kind === 'user'
-}
 
 interface SessionState {
   /** Rolling conversation tail for query expansion (capped at messageWindow). */
@@ -205,12 +201,15 @@ export class MemoryRuntime {
   // ---- write path: session/event observation (§5.1) ----
 
   private observeSessions(): void {
+    // 入口总开关（M3）：false = 不观察 dsh 会话事件，完全停写；
+    // 检索通道（memory_search 与自动注入）不受影响。
+    if (!this.config.intake.session.enabled) return
     this.ctx.on('session/event', (session: Session, event: SessionEvent) => {
       const state = this.stateFor(session)
       switch (event.type) {
         case 'user/message': {
           const message = event.data as UserMessage
-          if (!isHumanPrompt(message)) break
+          if (!isConversationMessage(message, this.config.intake.session.acceptSourceKinds)) break
           this.pushMessage(state, event, 'user', messageText(message))
           break
         }

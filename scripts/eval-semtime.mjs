@@ -82,6 +82,7 @@ const config = {
   },
   section: { enabled: true, maxMemories: 5, header: 'memories:' },
   tool: { enabled: true, maxResults: 5 },
+  intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
 }
 
 // ---- load dataset ----

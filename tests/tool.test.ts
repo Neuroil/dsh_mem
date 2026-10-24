@@ -22,6 +22,7 @@ const config: Config = {
   sleep: { enabled: true, minNewMemories: 10, clusterCos: 0.75, clusterMinSize: 3, qaPairCount: 3, qaF1Threshold: 0.8, epiThreshold: 0.5, conWindow: 1000, conAttachSigma: 0.5, conNewNodeSigma: -1, conNewNodeMinImp: 7, attachGain: 0.5 },
   section: { enabled: true, maxMemories: 5, header: 'memories:' },
   tool: { enabled: true, maxResults: 5 },
+  intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
 }
 
 /** 检索器替身：记录调用参数并回放固定结果。 */
