@@ -1,7 +1,0 @@
-- insert:
-    - id: storage-sqlite
-      name: '@deepseek-ai/dsh-storage-sqlite'
-      config:
-        path: 'C:/Users/Neuroil/Code/dsh_mem/tmp/probe.sqlite'
-    - id: probe-sqlite
-      name: 'C:/Users/Neuroil/Code/dsh_mem/tmp/probe-sqlite.mjs'
