@@ -31,7 +31,7 @@ const recallAt = Number(args['recall-at'] ?? 50)
 
 // ---- config: mirrors src/config.ts defaults ----
 const config = {
-  storage: { backend: 'json', unit: 'dsh-mem', version: 1 },
+  storage: { backend: 'json', unit: 'dsh_mem', version: 1 },
   embedding: {
     mode: args['embedding-mode'] ?? 'deterministic',
     endpoint: args['embedding-endpoint'] ?? 'https://api.siliconflow.cn/v1/embeddings',

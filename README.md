@@ -40,7 +40,7 @@ Relevant long-term memories (semantic retrieval; recency was not a factor):
 
 ### 3. 持久记忆库（ctx.storage，不自建数据库）
 
-- KV unit（默认名 `dsh-mem`，`config.storage.unit` 可改），两张表：`episodic`（MemoryRecord）与 `semantic`（SemanticNode，睡眠周期填充）。
+- KV unit（默认名 `dsh_mem`，`config.storage.unit` 可改；unit 名只允许小写字母/数字/下划线，**不允许连字符**——宿主规则 `/^[a-z][a-z0-9_]*$/`），两张表：`episodic`（MemoryRecord）与 `semantic`（SemanticNode，睡眠周期填充）。
 - 记录含 M5 判分（imp/valence/arousal/reasons）、邻域统计（r_m/red）、巩固分数 S、分层 tier（hot/warm/cold）、使用计数（used_count/suppressed_count/last_used_at/last_cue_quality/last_decay_at）——计数自 P2 起被 S 动态消费；语义节点带同构的可选 counters。
 - **软失效**：被取代的记录或语义节点只设 `invalid_at` / `superseded_by` 并移出检索索引，永不删除。矛盾判定带**时间重叠闸**（§2.5 完整版）：只对同一时间框架的矛盾软失效，"过去用 MySQL"与"现在用 PostgreSQL"这类不同时期的矛盾两条都保留。
 - **压缩归档**（P1）：被语义节点吸收的记录设 `flags.compressed_into` / `qa_passed` 与 `time_meta.compressed_at`（归档时点，时间旅行消费）并退出检索池；QA/epi 闸门拒收的簇标 `flags.incompressible`，全簇已标时需新成员加入才重试。
@@ -168,7 +168,7 @@ dsh plugin --profile web add C:/Users/you/Code/dsh_mem
 - 每轮 `turn/end` 后（有写入时）：`turn N: wrote X, superseded Y, dropped Z`；
 - 睡眠周期触发后：`sleep cycle: C clusters (M migrated, G gated), refreshed R records / N nodes, decayed R'/N'`；
 - 聊天 UI 出现 `memory_search` 工具卡片；库非空且命中时，`memory_search` 结果与自动记忆 section 出现在上下文（语义节点带 `gist` 标记）；
-- storage 后端介质上出现 `dsh-mem` unit。
+- storage 后端介质上出现 `dsh_mem` unit。
 
 ## 评测：nDCG 四档消融（设计 §7.1）
 
@@ -296,7 +296,7 @@ src/
 
 | 键 | 说明 |
 |---|---|
-| `storage.backend` / `unit` / `version` | KV 后端名（json/sqlite）、unit 名、格式版本 |
+| `storage.backend` / `unit` / `version` | KV 后端名（json/sqlite）、unit 名（**不含连字符**，规则同宿主 `/^[a-z][a-z0-9_]*$/`，连字符会被归一为下划线）、格式版本 |
 | `embedding.*` | mode(http/deterministic)、endpoint、model、apiKey、dimensions(1024)、batchSize |
 | `reranker.*` | 同上（无 dimensions） |
 | `llm.provider` / `model` / `temperature`(0) / `maxTokens` | 内部判分调用（经 ctx.llm） |

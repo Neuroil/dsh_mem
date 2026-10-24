@@ -10,6 +10,7 @@
  * 二者不会出现"镜像有、介质无"的偏离。
  */
 import type { KvUnit, KvUnitDescriptor } from '@deepseek-ai/dsh-storage'
+import { UNIT_NAME_RE } from './config.js'
 import type { Config } from './config.js'
 import type {
   MemoryRecord,
@@ -20,10 +21,20 @@ import type {
   VectorIndex,
 } from './types.js'
 
-/** KV unit 描述符：表 = episodic（MemoryRecord）+ semantic（SemanticNode），无 global 槽（§5.0）。 */
+/**
+ * KV unit 描述符：表 = episodic（MemoryRecord）+ semantic（SemanticNode），无 global 槽（§5.0）。
+ * unit 名在此归一化并本地校验：连字符归一为下划线（宿主不允许连字符），归一后
+ * 仍不满足 UNIT_NAME_RE 的名字在此抛错——让不合规命名在启动期暴露，而不是等
+ * 宿主 validateDescriptor 抛 malformed-medium 后被 apply() 的 catch 吞掉。
+ */
 export function memoryUnitDescriptor(config: Config): KvUnitDescriptor {
+  const name = config.storage.unit.replace(/-/g, '_')
+  if (!UNIT_NAME_RE.test(name)) {
+    throw new Error(`invalid storage unit name '${config.storage.unit}' (normalized '${name}'): ` +
+      `must match ${UNIT_NAME_RE} — lowercase letters/digits/underscores, no hyphens`)
+  }
   return {
-    name: config.storage.unit,
+    name,
     version: config.storage.version,
     tables: ['episodic', 'semantic'],
     hasGlobal: false,

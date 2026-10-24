@@ -120,7 +120,7 @@ export interface ToolConfig {
 export interface StorageConfig {
   /** Backend name registered on ctx.storage (`json` / `sqlite`). */
   backend: string
-  /** KV unit name; must satisfy UNIT_NAME_RE (safe as file/SQL name). */
+  /** KV unit name; must satisfy UNIT_NAME_RE — no hyphens (host rule, safe as file/SQL name). */
   unit: string
   /** Unit format version, bumped on incompatible record-shape changes. */
   version: number
@@ -149,12 +149,19 @@ const httpModel = (defaults: { endpoint: string; model: string; timeoutMs: numbe
     timeoutMs: Schema.number().min(100).default(defaults.timeoutMs),
   })
 
+/**
+ * 宿主 dsh-storage 的 unit 名规则（UNIT_NAME_RE）：小写字母开头，仅小写字母/
+ * 数字/下划线——**不允许连字符**（连字符会被宿主 validateDescriptor 以
+ * malformed-medium 拒绝）。schema 与 memoryUnitDescriptor 的本地校验共用。
+ */
+export const UNIT_NAME_RE = /^[a-z][a-z0-9_]*$/
+
 export const Config: Schema<Config> = Schema.object({
   storage: Schema.object({
     backend: Schema.string().default('json'),
-    unit: Schema.string().pattern(/^[a-z][a-z0-9_-]*$/).default('dsh-mem'),
+    unit: Schema.string().pattern(UNIT_NAME_RE).default('dsh_mem'),
     version: Schema.natural().default(1),
-  }).default({ backend: 'json', unit: 'dsh-mem', version: 1 }),
+  }).default({ backend: 'json', unit: 'dsh_mem', version: 1 }),
 
   // Embeddings and reranking are plugin-owned dependencies: dsh ships no
   // seam for them, so endpoints/models/dims are configured here (§3.1).
