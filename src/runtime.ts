@@ -290,7 +290,8 @@ export class MemoryRuntime {
       this.pendingQuery.delete(String(agent.id))
     })
 
-    this.ctx.on('agent/created', ({ agent }: { agent: Agent }) => {
+    // 0.2.x 起 agent/created 为 serial 事件：监听器需返回 undefined | Promise<undefined>（awaited）
+    this.ctx.on('agent/created', async ({ agent }: { agent: Agent }) => {
       // Agent-scoped registration: contributions unwind with the agent
       // (architecture doc: scope registrations to one agent via agent.ctx).
       agent.ctx.on('system-prompt/assemble', async (assembly, context, next) => {
