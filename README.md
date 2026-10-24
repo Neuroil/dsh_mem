@@ -128,12 +128,14 @@ turn/end 信号门控触发（自上次周期新写入 ≥ `sleep.minNewMemories
 
 ### 方式 A：本地源码加载（开发）
 
+> **必须先 `npm run build` 生成 `lib/`，插件路径指向 `lib/index.js`**。宿主 loader 不转译 TS，直接指 `src/index.ts` 会**静默加载失败**（无任何报错，工具与存储都不出现）。
+
 创建 `overlay.yml`（**插件路径必须是绝对路径**）：
 
 ```yaml
 - insert:
     - id: dsh-mem
-      name: 'C:/Users/you/Code/dsh_mem/src/index.ts'
+      name: 'C:/Users/you/Code/dsh_mem/lib/index.js'
       config:
         embedding:
           mode: http            # 无 key 冒烟改为 deterministic
