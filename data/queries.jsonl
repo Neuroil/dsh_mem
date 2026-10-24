@@ -1,0 +1,8 @@
+{"query":"which database should we use for the new service?","relevant":["m01"]}
+{"query":"why are our releases slow to ship?","relevant":["m03","m09","m06"]}
+{"query":"what do you know about my dietary restrictions?","relevant":["m07"]}
+{"query":"where does the user work?","relevant":["m08"]}
+{"query":"what editor do I use at home?","relevant":["m10"]}
+{"query":"what was decided about infrastructure this year?","relevant":["m04"]}
+{"query":"what was fixed recently in the product?","relevant":["m12"]}
+{"query":"any plans for the weekend?","relevant":["m05"]}

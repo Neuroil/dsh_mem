@@ -1,0 +1,307 @@
+import { describe, expect, it } from 'vitest'
+import { WritePipeline, type MemoryStoreLike } from '../src/write-path.js'
+import type { Config } from '../src/config.js'
+import type { EmbeddingProvider, InternalLlm, MemoryRecord } from '../src/types.js'
+
+const config: Config = {
+  storage: { backend: 'json', unit: 'dsh-mem', version: 1 },
+  embedding: { mode: 'deterministic', endpoint: '', model: '', apiKey: '', timeoutMs: 5_000, dimensions: 8, batchSize: 8 },
+  reranker: { mode: 'deterministic', endpoint: '', model: '', apiKey: '', timeoutMs: 5_000 },
+  llm: { provider: 'deepseek', model: 'deepseek-chat', temperature: 0, maxTokens: 2048 },
+  write: { messageWindow: 10, maxCandidates: 8, minImportance: 3, contradictionTopK: 5, contradictionMinCos: 0.8 },
+  retrieval: { l0TopK: 100, cslsTopK: 20, rerankTopK: 8, mmrTopK: 5, mmrLambda: 0.6, cslsK: 10, contextTurns: 3, coldCueBoost: 0.1, cueThreshold: 0.3 },
+  tier: { hotThreshold: 8, coldThreshold: 2 },
+  sleep: { enabled: true, minNewMemories: 10, clusterCos: 0.75, clusterMinSize: 3, qaPairCount: 3, qaF1Threshold: 0.8, epiThreshold: 0.5, conWindow: 1000, conAttachSigma: 0.5, conNewNodeSigma: -1, conNewNodeMinImp: 7, attachGain: 0.5 },
+  section: { enabled: true, maxMemories: 5, header: 'memories:' },
+  tool: { enabled: true, maxResults: 5 },
+}
+
+function makeRecord(over: Partial<MemoryRecord> = {}): MemoryRecord {
+  const now = 1_000
+  return {
+    id: over.id ?? 'existing-1',
+    text: over.text ?? 'existing text',
+    embedding: over.embedding ?? [1, 0, 0, 0, 0, 0, 0, 0],
+    imp: 5, valence: 0, arousal: 0,
+    epi: 0, red: 0, r_m: 0, tier: 'warm',
+    con_route: { kind: 'pending' }, links: [], S: 5,
+    counters: { used_count: 0, suppressed_count: 0 },
+    time_meta: { created_at: now, valid_at: now },
+    flags: {},
+    ...over,
+  }
+}
+
+/** 记录调用序的假存储。 */
+class FakeStore implements MemoryStoreLike {
+  readonly records = new Map<string, MemoryRecord>()
+  readonly softInvalidations: Array<{ id: string; by: string }> = []
+  readonly refreshed: string[] = []
+  similarCalls: number = 0
+  /** 控制 similar() 返回什么；为空时对已入库记录算真实余弦（与 MemoryStore 语义一致）。 */
+  nextNeighbors: Array<{ id: string; cos: number; record: MemoryRecord }> = []
+
+  validMemories(): readonly MemoryRecord[] { return [...this.records.values()] }
+  similar(vector: readonly number[], _k: number): readonly { id: string; cos: number; record: MemoryRecord }[] {
+    this.similarCalls++
+    if (this.nextNeighbors.length > 0) return this.nextNeighbors
+    return [...this.records.values()]
+      .map((record) => ({ id: record.id, cos: cosine(vector, record.embedding), record }))
+      .sort((a, b) => b.cos - a.cos)
+  }
+  async putRecord(record: MemoryRecord): Promise<void> { this.records.set(record.id, record) }
+  async softInvalidate(id: string, by: string): Promise<void> { this.softInvalidations.push({ id, by }) }
+  async refreshNeighborhood(id: string): Promise<{ r_m: number; red: number }> {
+    this.refreshed.push(id)
+    const record = this.records.get(id)
+    if (record) this.records.set(id, { ...record, r_m: 0.42, red: 0.3 })
+    return { r_m: 0.42, red: 0.3 }
+  }
+}
+
+function cosine(a: readonly number[], b: readonly number[]): number {
+  let dot = 0
+  let na = 0
+  let nb = 0
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? 0
+    const y = b[i] ?? 0
+    dot += x * y
+    na += x * x
+    nb += y * y
+  }
+  const denom = Math.sqrt(na) * Math.sqrt(nb)
+  return denom === 0 ? 0 : dot / denom
+}
+
+class FakeLlm implements InternalLlm {
+  private queue: string[]
+  readonly completions: Array<{ system: string; user: string; signal?: AbortSignal }> = []
+  constructor(replies: string[]) { this.queue = [...replies] }
+  async complete(system: string, user: string, signal?: AbortSignal): Promise<string> {
+    this.completions.push({ system, user, signal })
+    const reply = this.queue.shift()
+    if (reply === undefined) throw new Error('FakeLlm exhausted')
+    return reply
+  }
+}
+
+const embedding: EmbeddingProvider = {
+  dimensions: 8,
+  async embed(texts: readonly string[]) {
+    return texts.map((text, i) => {
+      const v = new Array(8).fill(0)
+      v[i % 8] = 1
+      void text
+      return v
+    })
+  },
+}
+
+const MESSAGES = [{ role: 'user' as const, text: '我把默认数据库从 MySQL 换成了 Postgres' }]
+
+function importances(score: number): string[] {
+  // 每个候选一次 M5 调用
+  return [`{"importance":${score},"valence":0,"arousal":0,"reasons":["decision"]}`]
+}
+
+describe('WritePipeline.processTurn', () => {
+  it('全流程：抽取→M5→（无矛盾）→入库→刷新邻域；S=imp、tier 正确', async () => {
+    const store = new FakeStore()
+    const llm = new FakeLlm([
+      '["用户把默认数据库从 MySQL 迁移到 Postgres"]', // 抽取
+      ...importances(9), // M5 → hot
+    ])
+    const pipeline = new WritePipeline({ llm, embedding, store, config, now: () => 1234 })
+    const outcome = await pipeline.processTurn('s1', 3, MESSAGES)
+
+    expect(outcome.written.length).toBe(1)
+    expect(outcome.dropped).toBe(0)
+    const record = outcome.written[0]!
+    expect(record.S).toBe(9)
+    expect(record.tier).toBe('hot')
+    expect(record.imp).toBe(9)
+    expect(record.time_meta.valid_at).toBe(1234)
+    expect(record.origin).toEqual({ session_id: 's1', turn: 3, seq: 0 })
+    expect(store.refreshed).toEqual([record.id])
+    expect(store.records.get(record.id)!.r_m).toBeCloseTo(0.42)
+  })
+
+  it('M5 低分候选被丢弃不入库', async () => {
+    const store = new FakeStore()
+    const llm = new FakeLlm(['["闲聊一句话"]', ...importances(2)])
+    const pipeline = new WritePipeline({ llm, embedding, store, config })
+    const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
+    expect(outcome.written).toEqual([])
+    expect(outcome.dropped).toBe(1)
+    expect(store.records.size).toBe(0)
+    // 低分在矛盾判定之前丢弃：similar 不应被调用
+    expect(store.similarCalls).toBe(0)
+  })
+
+  it('contradicts：softInvalidate 先于 putRecord，新记录带 supersedes 链接', async () => {
+    const store = new FakeStore()
+    const existing = makeRecord({ id: 'old-1', text: '用户默认数据库是 MySQL' })
+    store.records.set('old-1', existing)
+    store.nextNeighbors = [{ id: 'old-1', cos: 0.93, record: existing }]
+    const llm = new FakeLlm([
+      '["用户把默认数据库从 MySQL 换成了 Postgres"]',
+      ...importances(7),
+      '{"index":0,"verdict":"contradicts"}',
+    ])
+    const pipeline = new WritePipeline({ llm, embedding, store, config, now: () => 2000 })
+    const outcome = await pipeline.processTurn('s1', 2, MESSAGES)
+
+    expect(outcome.superseded).toEqual([{ id: 'old-1', by: outcome.written[0]!.id }])
+    expect(store.softInvalidations).toEqual([{ id: 'old-1', by: outcome.written[0]!.id }])
+    expect(outcome.written[0]!.links).toEqual([{ kind: 'supersedes', target: 'old-1' }])
+  })
+
+  it('complements：新记录带 complements 链接，旧记录不动', async () => {
+    const store = new FakeStore()
+    const existing = makeRecord({ id: 'old-2', text: '用户在维护数据库迁移工具' })
+    store.nextNeighbors = [{ id: 'old-2', cos: 0.85, record: existing }]
+    const llm = new FakeLlm(['["用户为迁移工具写了回滚脚本"]', ...importances(6), '{"index":0,"verdict":"complements"}'])
+    const pipeline = new WritePipeline({ llm, embedding, store, config })
+    const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
+    expect(outcome.written[0]!.links).toEqual([{ kind: 'complements', target: 'old-2' }])
+    expect(store.softInvalidations).toEqual([])
+  })
+
+  it('duplicate：NOOP 不写库', async () => {
+    const store = new FakeStore()
+    const existing = makeRecord({ id: 'old-3', text: '用户用 Postgres' })
+    store.nextNeighbors = [{ id: 'old-3', cos: 0.99, record: existing }]
+    const llm = new FakeLlm(['["用户用 Postgres"]', ...importances(6), '{"index":0,"verdict":"duplicate"}'])
+    const pipeline = new WritePipeline({ llm, embedding, store, config })
+    const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
+    expect(outcome.written).toEqual([])
+    expect(outcome.dropped).toBe(1)
+    expect(store.records.size).toBe(0)
+  })
+
+  it('与库中已有文本完全相同的候选走 NOOP（不消耗 M5 调用）', async () => {
+    const store = new FakeStore()
+    store.records.set('old-4', makeRecord({ id: 'old-4', text: '已存在的记忆文本' }))
+    const llm = new FakeLlm(['["已存在的记忆文本"]']) // 只有抽取一次调用
+    const pipeline = new WritePipeline({ llm, embedding, store, config })
+    const outcome = await pipeline.processTurn('s1', 1, [{ role: 'user', text: '随便' }])
+    expect(outcome).toEqual({ turn: 1, written: [], superseded: [], dropped: 0 })
+    expect(llm.completions.length).toBe(1)
+  })
+
+  it('近邻余弦低于 contradictionMinCos 时不送判定（不发生 LLM 矛盾调用）', async () => {
+    const store = new FakeStore()
+    const existing = makeRecord({ id: 'far-1', text: '无关记忆' })
+    store.nextNeighbors = [{ id: 'far-1', cos: 0.5, record: existing }]
+    const llm = new FakeLlm(['["候选"]', ...importances(6)]) // 无第三次调用
+    const pipeline = new WritePipeline({ llm, embedding, store, config })
+    const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
+    expect(outcome.written.length).toBe(1)
+    expect(llm.completions.length).toBe(2)
+  })
+
+  it('单候选失败不中断整轮：其余候选入库', async () => {
+    const store = new FakeStore()
+    const llm = new FakeLlm([
+      '["候选甲", "候选乙"]',
+      '坏掉的回复', // 甲的 M5 第一次失败
+      '还是坏的', // 甲的 M5 重试失败 → 甲 dropped
+      ...importances(7), // 乙的 M5
+    ])
+    const logs: string[] = []
+    const pipeline = new WritePipeline({ llm, embedding, store, config, log: (m) => logs.push(m) })
+    const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
+    expect(outcome.written.length).toBe(1)
+    expect(outcome.dropped).toBe(1)
+    expect(logs.length).toBe(1)
+  })
+
+  it('signal 传播到 LLM 调用', async () => {
+    const store = new FakeStore()
+    const controller = new AbortController()
+    const llm = new FakeLlm(['["候选"]'])
+    const pipeline = new WritePipeline({ llm, embedding, store, config })
+    await pipeline.processTurn('s1', 1, MESSAGES, controller.signal)
+    expect(llm.completions[0]!.signal).toBe(controller.signal)
+  })
+
+  it('messageWindow 截断：抽取只看到窗口内消息', async () => {
+    const store = new FakeStore()
+    const llm = new FakeLlm(['["候选"]', ...importances(5)])
+    const pipeline = new WritePipeline({ llm, embedding, store, config: { ...config, write: { ...config.write, messageWindow: 2 } } })
+    const longHistory = [
+      { role: 'user' as const, text: 'msg1' }, { role: 'assistant' as const, text: 'msg2' },
+      { role: 'user' as const, text: 'msg3' }, { role: 'assistant' as const, text: 'msg4' },
+      { role: 'user' as const, text: 'msg5' },
+    ]
+    await pipeline.processTurn('s1', 1, longHistory)
+    expect(llm.completions[0]!.user).toContain('msg4')
+    expect(llm.completions[0]!.user).toContain('msg5')
+    expect(llm.completions[0]!.user).not.toContain('msg3')
+  })
+
+  it('嵌入向量缺口：缺向量的候选丢弃，其余照常入库', async () => {
+    const store = new FakeStore()
+    const gappy: EmbeddingProvider = {
+      dimensions: 8,
+      // 只回填第一个文本的向量（模拟服务端缺口）
+      async embed(texts: readonly string[]) {
+        return texts.slice(0, 1).map((_, i) => {
+          const v = new Array(8).fill(0)
+          v[i] = 1
+          return v
+        })
+      },
+    }
+    const llm = new FakeLlm(['["候选甲", "候选乙"]', ...importances(7)])
+    const pipeline = new WritePipeline({ llm, embedding: gappy, store, config })
+    const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
+    expect(outcome.written.length).toBe(1)
+    expect(outcome.dropped).toBe(1)
+    expect(store.records.size).toBe(1)
+  })
+
+  it('signal 中止后单候选错误原样上抛（不被吞成 dropped）', async () => {
+    const store = new FakeStore()
+    const controller = new AbortController()
+    const abortingEmbed: EmbeddingProvider = {
+      dimensions: 8,
+      async embed(texts: readonly string[]) {
+        controller.abort() // 嵌入阶段触发中止
+        return texts.map(() => new Array<number>(8).fill(0))
+      },
+    }
+    // 抽取后队列耗尽：甲的 M5 两次调用均抛 → completeJson 抛 → catch 分支按 aborted 上抛
+    const llm = new FakeLlm(['["候选甲", "候选乙"]'])
+    const pipeline = new WritePipeline({ llm, embedding: abortingEmbed, store, config })
+    await expect(pipeline.processTurn('s1', 1, MESSAGES, controller.signal)).rejects.toThrow()
+    expect(store.records.size).toBe(0)
+  })
+
+  it('同轮先写入的候选对后续候选的矛盾判定可见（经 store.similar 查已入库记录）', async () => {
+    const store = new FakeStore()
+    // 按关键词聚类的嵌入：两条候选含同一关键词 → 向量相同 → cos=1
+    const clustered: EmbeddingProvider = {
+      dimensions: 8,
+      async embed(texts: readonly string[]) {
+        return texts.map((text) => {
+          const v = new Array<number>(8).fill(0)
+          v[text.includes('Postgres') ? 0 : 1] = 1
+          return v
+        })
+      },
+    }
+    const llm = new FakeLlm([
+      '["用户使用 Postgres", "用户使用 Postgres 作为主数据库"]',
+      ...importances(7), // 甲 M5（此时库空，无矛盾调用）
+      ...importances(7), // 乙 M5
+      '{"index":0,"verdict":"duplicate"}', // 乙对甲（同轮先入库）判定为重复
+    ])
+    const pipeline = new WritePipeline({ llm, embedding: clustered, store, config })
+    const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
+    expect(outcome.written.length).toBe(1)
+    expect(outcome.dropped).toBe(1)
+    expect(store.records.size).toBe(1)
+  })
+})

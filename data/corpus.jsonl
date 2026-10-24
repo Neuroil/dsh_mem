@@ -1,0 +1,12 @@
+{"id":"m01","text":"User prefers PostgreSQL over MySQL for production databases"}
+{"id":"m02","text":"User's production database is MySQL, hosted on RDS"}
+{"id":"m03","text":"Deployment delays are usually caused by configuration complexity"}
+{"id":"m04","text":"User decided to migrate all services to Kubernetes by Q3"}
+{"id":"m05","text":"User likes hiking in the mountains on weekends"}
+{"id":"m06","text":"The CI pipeline takes about 40 minutes due to slow integration tests"}
+{"id":"m07","text":"User is allergic to peanuts"}
+{"id":"m08","text":"User works in the machine learning team at Acme Corp"}
+{"id":"m09","text":"Complex configuration often slows down deployment pipelines"}
+{"id":"m10","text":"User's favorite editor is Neovim with a custom keybinding setup"}
+{"id":"m11","text":"User asked the team to review the migration plan last Tuesday"}
+{"id":"m12","text":"Release 2.3 fixed the login timeout bug reported by users"}

@@ -1,0 +1,21 @@
+# Bundle patch for dsh-mem (installed via `dsh plugin add <this package>`).
+# Overlays replace a whole entry config by id — restate the full `config`
+# when overriding any key here.
+- id: dsh-mem
+  name: dsh-mem
+  config:
+    storage:
+      backend: json
+    embedding:
+      mode: http
+      endpoint: https://api.siliconflow.cn/v1/embeddings
+      model: BAAI/bge-m3
+      apiKey: !!js process.env.MEM_EMBEDDING_API_KEY ?? ''
+    reranker:
+      mode: http
+      endpoint: https://api.siliconflow.cn/v1/rerank
+      model: BAAI/bge-reranker-v2-m3
+      apiKey: !!js process.env.MEM_RERANKER_API_KEY ?? ''
+    llm:
+      provider: deepseek
+      model: deepseek-chat
