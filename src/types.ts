@@ -40,6 +40,24 @@ export interface ImportanceVerdict {
 /** Simplified contradiction verdict against one similar memory (§2.5, Mem0-style). */
 export type SupersessionVerdict = 'contradicts' | 'complements' | 'duplicate' | 'unrelated'
 
+/**
+ * 矛盾的时间重叠判定（§2.5 完整版，P2）：'overlapping' = 两条陈述针对同一
+ * （或现在时）时间框架，只有此时才软失效旧记忆；'disjoint' = 描述不同时期
+ * （如"过去用 MySQL"vs"现在用 PostgreSQL"），两条都真、均保留。判分缺省
+ * 视为 overlapping（保持 P0 语义的安全网）。
+ */
+export type TemporalOverlap = 'overlapping' | 'disjoint'
+
+/** 使用/抑制/衰减记账（§2.1 S 动态的记录侧）。记录侧 P0 落位；节点侧 P2 起可选。 */
+export interface ScoreCounters {
+  used_count: number
+  suppressed_count: number
+  last_used_at?: number
+  last_cue_quality?: number
+  /** 上次兜底衰减锚点（§2.1）；缺省以 time_meta.created_at 为锚（旧记录容忍）。 */
+  last_decay_at?: number
+}
+
 /** Where this memory came from (session log provenance, for audit only). */
 export interface MemoryOrigin {
   readonly session_id: string
@@ -69,18 +87,15 @@ export interface MemoryRecord {
   /** M4 routing outcome — `pending` until the P1 sleep cycle attaches nodes. */
   con_route: { kind: 'attached'; nodeIds: readonly string[] } | { kind: 'new_node'; nodeId: string } | { kind: 'pending' }
   links: MemoryLink[]
-  /** Consolidation score. P0: initialized to `imp`; full dynamics land in P2. */
+  /** Consolidation score (§2.1): initialized to `imp` at write time; use/suppress events and fallback decay drive it afterwards (scoring.ts, P2). */
   S: number
-  counters: {
-    used_count: number
-    suppressed_count: number
-    last_used_at?: number
-    last_cue_quality?: number
-  }
+  counters: ScoreCounters
   time_meta: {
     created_at: number
     valid_at: number
     invalid_at?: number
+    /** 归档时点（P2，§2.3 第 6 步写入）：时间旅行视图据此判定"当时是否还在检索宇宙"。 */
+    compressed_at?: number
   }
   flags: {
     superseded_by?: string
@@ -109,6 +124,10 @@ export interface SemanticNode {
   S: number
   /** CSLS r(m) 项（§3.2）：与检索宇宙 top-k 近邻的平均余弦，睡眠周期第 7 步刷新。 */
   r_m: number
+  /** 使用/抑制/衰减记账（P2，§2.1 节点侧 S 动态）；旧节点缺省按全 0 容忍。 */
+  counters?: ScoreCounters
+  /** 被新记忆推翻时指向取代者（支柱五完整版，P2；与记录 flags.superseded_by 同义）。 */
+  superseded_by?: string
 }
 
 /** One QA pair for the sleep-cycle compression gate (§2.3 step 3). */
@@ -142,6 +161,9 @@ export interface SleepOutcome {
   readonly refreshedRecords: number
   /** Node ids whose r_m was refreshed (step 7). */
   readonly refreshedNodes: readonly string[]
+  /** 第 7 步兜底衰减（§2.1，P2）：本周期应用衰减的记录数 / 节点数。 */
+  readonly decayedRecords: number
+  readonly decayedNodes: number
 }
 
 /** A candidate at one stage of the retrieval pipeline (§5.2). */
@@ -215,8 +237,10 @@ export interface VectorIndex {
   search(query: readonly number[], k: number, filter?: (id: string) => boolean): readonly Neighbor[]
 }
 
-/** Simplified-contradiction judgment against one existing valid memory. */
+/** Contradiction judgment against one existing valid memory or semantic node (§2.5). */
 export interface ContradictionJudgment {
   readonly verdict: SupersessionVerdict
   readonly againstId: string
+  /** 仅 verdict === 'contradicts' 时有意义：时间重叠才软失效（§2.5 完整版）。 */
+  readonly temporal?: TemporalOverlap
 }

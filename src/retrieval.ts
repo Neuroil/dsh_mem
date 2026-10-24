@@ -19,6 +19,12 @@ import type {
 export interface MemoryLookup {
   /** L0 检索池（§5.2）：有效未压缩情景记录 + 有效语义节点。 */
   retrievable(): readonly RetrievableItem[]
+  /**
+   * 时点重建的 L0 检索池（§2.5 完整版时间旅行，P2）：valid_at ≤ at <
+   * invalid_at 且当时未压缩的记录 + 当时有效的语义节点。MemoryStore 实现；
+   * 测试替身可省略（省略时时间旅行查询退化为当前池）。
+   */
+  retrievableAt?(at: number): readonly RetrievableItem[]
 }
 
 /**
@@ -40,6 +46,8 @@ export interface RetrieveOptions {
   readonly signal?: AbortSignal
   /** 覆盖最终输出条数（默认 config.mmrTopK）。 */
   readonly topK?: number
+  /** 时间旅行时点（epoch ms，§2.5 完整版）：检索池换为该时点的记忆状态。 */
+  readonly at?: number
 }
 
 /** id 字典序，平局时的确定性决胜（保证测试可复现）。 */
@@ -80,8 +88,11 @@ export class MemoryRetriever {
     const result = (top: readonly ScoredCandidate[], suppressed: readonly ScoredCandidate[]): RetrievalResult =>
       ({ query, expandedQuery, stages, top, suppressed })
 
-    // ---- L0 召回（§3.1）：q' 嵌入一次，对检索宇宙（记录 + 语义节点）算余弦，取 top l0TopK
-    const items = this.lookup.retrievable()
+    // ---- L0 召回（§3.1）：q' 嵌入一次，对检索宇宙（记录 + 语义节点；时间旅行
+    // 时换为 at 时点重建视图，§2.5）算余弦，取 top l0TopK
+    const items = opts.at !== undefined
+      ? (this.lookup.retrievableAt?.(opts.at) ?? this.lookup.retrievable())
+      : this.lookup.retrievable()
     if (items.length === 0) return result([], []) // 空库：跳过嵌入与精排，直接空结果
     const embedded = await this.embedding.embed([expandedQuery], opts.signal)
     const queryVector = embedded[0]

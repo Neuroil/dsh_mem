@@ -1,8 +1,8 @@
 /**
- * 写入路径（设计 §5.1）：turn/end 后对本轮消息批量抽取候选，再对每条候选
- * 执行 O(1) 次模型调用：嵌入（批量一次）→ M5 判分 → ANN 近邻 → 简化矛盾
- * 判定（矛盾即软失效，补充建链，重复 NOOP）→ S 初始化为 imp → 落库并刷新
- * r_m / red 邻域统计。
+ * 写入路径（设计 §5.1 + §2.5 完整版）：turn/end 后对本轮消息批量抽取候选，
+ * 再对每条候选执行 O(1) 次模型调用：嵌入（批量一次）→ M5 判分 → ANN 近邻
+ * （有效记录含已压缩者 + 有效语义节点）→ 矛盾判定（时间重叠才软失效；
+ * 目标可以是语义节点）→ S 初始化为 imp → 落库并刷新 r_m / red 邻域统计。
  */
 import type { Config } from './config.js'
 import {
@@ -12,15 +12,19 @@ import {
   judgeImportance,
   type TurnMessage,
 } from './judges.js'
-import type { EmbeddingProvider, InternalLlm, MemoryRecord, MemoryTier } from './types.js'
+import type { EmbeddingProvider, InternalLlm, MemoryRecord, MemoryTier, SemanticNode } from './types.js'
 
 /** 存储层最小依赖（由 MemoryStore 结构满足；窄接口保持可测）。 */
 export interface MemoryStoreLike {
   validMemories(): readonly MemoryRecord[]
   /** 同步签名：底层 VectorIndex 是同步精确 kNN（与 MemoryStore.similar 一致）。 */
   similar(vector: readonly number[], k: number): readonly { id: string; cos: number; record: MemoryRecord }[]
+  /** 有效语义节点近邻（支柱五完整版：gist 也可被新记忆推翻）。 */
+  similarNodes(vector: readonly number[], k: number): readonly { id: string; cos: number; node: SemanticNode }[]
   putRecord(record: MemoryRecord): Promise<void>
   softInvalidate(id: string, supersededBy: string, at: number): Promise<void>
+  /** 语义节点软失效（幂等，§2.5 完整版）。 */
+  softInvalidateNode(id: string, supersededBy: string, at: number): Promise<void>
   refreshNeighborhood(id: string, k: number): Promise<{ r_m: number; red: number }>
 }
 
@@ -110,17 +114,22 @@ export class WritePipeline {
           tier: tierOf(verdict.importance, config.tier),
           con_route: { kind: 'pending' },
           links: [],
-          S: verdict.importance, // §2.1：S 初始化为 imp；完整动态在 P2
+          S: verdict.importance, // §2.1：S 初始化为 imp；后续动态见 scoring.ts
           counters: { used_count: 0, suppressed_count: 0 },
           time_meta: { created_at: now(), valid_at: now() },
           flags: {},
           origin: { session_id: sessionId, turn, seq: i },
         }
 
-        // 简化矛盾判定（§5.1 第 5 步）：top 相似且有效的记忆做一次 LLM 判定
-        const neighbors = this.deps.store.similar(vector, config.write.contradictionTopK)
+        // 矛盾判定（§5.1 第 5 步 / §2.5 完整版）：top 相似且有效的记录（含已
+        // 压缩归档者）与语义节点（gist）一起送判；记录在前、节点在后，确定性有序
+        const neighborRecords = this.deps.store.similar(vector, config.write.contradictionTopK)
           .filter((n) => n.cos >= config.write.contradictionMinCos)
           .map((n) => ({ id: n.id, text: n.record.text }))
+        const neighborNodes = this.deps.store.similarNodes(vector, config.write.contradictionTopK)
+          .filter((n) => n.cos >= config.write.contradictionMinCos)
+          .map((n) => ({ id: n.id, text: n.node.gist }))
+        const neighbors = [...neighborRecords, ...neighborNodes]
         const judgment = await judgeContradiction(this.deps.llm, text, neighbors, signal)
 
         if (judgment?.verdict === 'duplicate') {
@@ -128,9 +137,19 @@ export class WritePipeline {
           continue
         }
         if (judgment?.verdict === 'contradicts') {
-          await this.deps.store.softInvalidate(judgment.againstId, id, now())
-          record.links.push({ kind: 'supersedes', target: judgment.againstId })
-          superseded.push({ id: judgment.againstId, by: id })
+          if (judgment.temporal === 'disjoint') {
+            // 时间上不重叠的矛盾（§2.5 完整版）：两条陈述针对不同时期，都真，
+            // 不软失效不建链——旧时记忆是合法的历史状态
+          } else {
+            const againstNode = neighborNodes.some((n) => n.id === judgment.againstId)
+            if (againstNode) {
+              await this.deps.store.softInvalidateNode(judgment.againstId, id, now())
+            } else {
+              await this.deps.store.softInvalidate(judgment.againstId, id, now())
+            }
+            record.links.push({ kind: 'supersedes', target: judgment.againstId })
+            superseded.push({ id: judgment.againstId, by: id })
+          }
         } else if (judgment?.verdict === 'complements') {
           record.links.push({ kind: 'complements', target: judgment.againstId })
         }

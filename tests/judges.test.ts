@@ -130,7 +130,8 @@ describe('judgeContradiction', () => {
     const verdict: SupersessionVerdict | null = (await judgeContradiction(llm, 'c', neighbors))?.verdict ?? null
     const judgment = await judgeContradiction(new FakeLlm(['{"index":1,"verdict":"contradicts"}']), 'c', neighbors)
     expect(verdict).toBe('contradicts')
-    expect(judgment).toEqual({ verdict: 'contradicts', againstId: 'm2' })
+    // temporal 缺省按 overlapping（P0 安全网语义保持）
+    expect(judgment).toEqual({ verdict: 'contradicts', againstId: 'm2', temporal: 'overlapping' })
   })
 })
 

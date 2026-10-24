@@ -67,6 +67,18 @@ export interface TierConfig {
   coldThreshold: number
 }
 
+/** 支柱一 S 完整动态（§2.1，P2）。 */
+export interface ScoreConfig {
+  /** 成功使用增益 α（§2.1：S ← S + α·(1 + cue_quality)，经 arousal 乘法门）。 */
+  useGain: number
+  /** 抑制事件惩罚 ε（§2.1：S ← S − ε，每查询至多计一次）。 */
+  suppressPenalty: number
+  /** 兜底衰减时间常数 τ（天；§2.1 S ← S·e^(−1/τ) 每日，只影响分层、永不删除）。 */
+  decayTauDays: number
+  /** 层级跃迁重判 M5 时新判分的 EMA 权重（§3.5「重判时取 EMA」）。 */
+  rejudgeEma: number
+}
+
 /** 离线巩固周期（"睡眠"，设计 §2.3/§5.3）。 */
 export interface SleepConfig {
   enabled: boolean
@@ -90,7 +102,7 @@ export interface SleepConfig {
   conNewNodeSigma: number
   /** 建新语义节点的最低簇均 imp（§3.4 imp ≥ 7）。 */
   conNewNodeMinImp: number
-  /** 挂入已有节点时的节点 S 增益（§2.1 α = 0.5 的沿用，完整 S 动态在 P2）。 */
+  /** 挂入已有节点时的节点 S 增益（§2.1 α = 0.5 的沿用；使用/抑制/衰减动态见 score 段）。 */
   attachGain: number
 }
 
@@ -122,6 +134,7 @@ export interface Config {
   write: WriteConfig
   retrieval: RetrievalConfig
   tier: TierConfig
+  score: ScoreConfig
   sleep: SleepConfig
   section: SectionConfig
   tool: ToolConfig
@@ -224,6 +237,14 @@ export const Config: Schema<Config> = Schema.object({
     hotThreshold: Schema.number().default(8),
     coldThreshold: Schema.number().default(2),
   }).default({ hotThreshold: 8, coldThreshold: 2 }),
+
+  // 支柱一 S 完整动态（§2.1，P2）
+  score: Schema.object({
+    useGain: Schema.number().min(0).default(0.5),
+    suppressPenalty: Schema.number().min(0).default(0.05),
+    decayTauDays: Schema.number().min(1).default(180),
+    rejudgeEma: Schema.percent().default(0.5),
+  }).default({ useGain: 0.5, suppressPenalty: 0.05, decayTauDays: 180, rejudgeEma: 0.5 }),
 
   // 离线巩固周期（§2.3/§5.3）：turn/end 信号触发，批处理在空闲期执行
   sleep: Schema.object({

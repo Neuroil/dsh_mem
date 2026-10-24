@@ -1,0 +1,5 @@
+{"query":"which database should we use for the new service?","relevant":["t01"]}
+{"query":"which database were we using in June?","relevant":["t02"],"at":"2026-06-15"}
+{"query":"why are our releases slow to ship?","relevant":["t03","t07"]}
+{"query":"what do you know about my dietary restrictions?","relevant":["t06"]}
+{"query":"what did we decide about branching?","relevant":["t05"]}

@@ -20,7 +20,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "eval:ndcg": "node scripts/eval-ndcg.mjs",
-    "eval:sleep": "node scripts/eval-sleep.mjs"
+    "eval:sleep": "node scripts/eval-sleep.mjs",
+    "eval:semtime": "node scripts/eval-semtime.mjs"
   },
   "keywords": [
     "dsh",

@@ -1,0 +1,8 @@
+{"id":"t01","text":"User prefers PostgreSQL over MySQL for production databases","time":"2026-08-01","imp":8}
+{"id":"t02","text":"User's production database is MySQL, hosted on RDS","time":"2026-04-01","validAt":"2026-04-01","invalidAt":"2026-08-01","imp":6}
+{"id":"t03","text":"Deployment delays are usually caused by configuration complexity","time":"2025-01-15","imp":7}
+{"id":"t04","text":"User went hiking on the Blue Ridge trail last weekend","time":"2026-10-18","imp":2}
+{"id":"t05","text":"The team decided to adopt trunk-based development in March","time":"2026-03-10","imp":6}
+{"id":"t06","text":"User is allergic to peanuts and tree nuts","time":"2025-06-20","imp":9}
+{"id":"t07","text":"CI pipeline flakiness comes from shared test fixtures","time":"2026-02-11","imp":7}
+{"id":"t08","text":"User chatted about weekend hiking plans","time":"2026-10-20","imp":2}

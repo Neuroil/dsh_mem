@@ -443,3 +443,48 @@ describe('MemoryRetriever', () => {
     expect(ids(result.top)).toEqual(['m1'])
   })
 })
+
+describe('MemoryRetriever 时间旅行（§2.5 完整版，P2）', () => {
+  const nowItems = (): RetrievableItem[] => [
+    makeItem({ id: 'current', text: 'current', embedding: unitByX(0.9) }),
+  ]
+  const pastItems = (): RetrievableItem[] => [
+    makeItem({ id: 'superseded', text: 'superseded', embedding: unitByX(0.9) }),
+    makeItem({ id: 'old-but-live', text: 'old-but-live', embedding: unitByX(0.8) }),
+  ]
+
+  function timeTravelRetriever() {
+    const { provider: embedding, embed } = makeEmbedding({ [QUERY]: QVEC, ...Object.fromEntries(pastItems().map(i => [i.text, i.embedding])) })
+    const { provider: reranker, rerank } = makeReranker(scoreReranker({ superseded: 1, 'old-but-live': 1 }))
+    let calls = 0
+    const lookup: MemoryLookup = {
+      retrievable: () => { calls++; return nowItems() },
+      retrievableAt: (at: number) => { calls++; expect(at).toBe(1_700_000_000_000); return pastItems() },
+    }
+    const retriever = new MemoryRetriever({ embedding, reranker, lookup, config: makeConfig() })
+    return { retriever, embed, rerank, callsRef: () => calls }
+  }
+
+  it('传 at：L0 池换用 retrievableAt(at)，软失效前的记忆重新可检索', async () => {
+    const { retriever, callsRef } = timeTravelRetriever()
+    const result = await retriever.retrieve(QUERY, { at: 1_700_000_000_000 })
+    expect(result.stages.l0.map(c => c.id).sort()).toEqual(['old-but-live', 'superseded'])
+    expect(callsRef()).toBe(1)
+  })
+
+  it('不传 at：仍走 retrievable()（当前视图）', async () => {
+    const { retriever, callsRef } = timeTravelRetriever()
+    const result = await retriever.retrieve(QUERY)
+    expect(ids(result.stages.l0)).toEqual(['current'])
+    expect(callsRef()).toBe(1)
+  })
+
+  it('lookup 未实现 retrievableAt：传 at 退化为当前池（测试替身兼容）', async () => {
+    const { provider: embedding } = makeEmbedding({ [QUERY]: QVEC })
+    const { provider: reranker } = makeReranker(scoreReranker({}))
+    const lookup: MemoryLookup = { retrievable: () => nowItems() }
+    const retriever = new MemoryRetriever({ embedding, reranker, lookup, config: makeConfig() })
+    const result = await retriever.retrieve(QUERY, { at: 1 })
+    expect(ids(result.stages.l0)).toEqual(['current'])
+  })
+})

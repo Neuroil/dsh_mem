@@ -168,11 +168,16 @@ export async function judgeImportance(
 }
 
 const CONTRADICTION_SYSTEM = `You judge how a NEW memory statement relates to similar EXISTING
-memories. Return ONLY a JSON object:
+memories (some may be distilled summary statements of older memories).
+Return ONLY a JSON object:
 {"index": <0-based index of the most-related existing memory>,
- "verdict": "contradicts" | "complements" | "duplicate" | "unrelated"}
-- "contradicts": the two statements cannot both be true now (the old one is
-  superseded).
+ "verdict": "contradicts" | "complements" | "duplicate" | "unrelated",
+ "temporal": "overlapping" | "disjoint"}
+- "contradicts": the two statements cannot both hold — the old one is superseded.
+- "temporal" (only for "contradicts"): "overlapping" when both make claims about
+  the same time frame (present-tense claims included) — only then is the old
+  memory superseded; "disjoint" when they describe genuinely different periods
+  (e.g. a past state that has since legitimately changed) — then both stay valid.
 - "complements": they add different facets of the same subject.
 - "duplicate": the new statement adds nothing over the existing one.
 - "unrelated": nothing above applies. No prose.`
@@ -180,8 +185,9 @@ memories. Return ONLY a JSON object:
 const VERDICTS: readonly SupersessionVerdict[] = ['contradicts', 'complements', 'duplicate', 'unrelated']
 
 /**
- * 简化矛盾判定（§2.5）：一次调用判定全部近邻，返回最强判定；
- * 无近邻或全部无关返回 null。
+ * 简化矛盾判定（§2.5 完整版）：一次调用判定全部近邻（记录 + 语义节点 gist），
+ * 返回最强判定；contradicts 附带时间重叠判定（缺省/非法值按 overlapping，
+ * 保持 P0 语义）；无近邻或全部无关返回 null。
  */
 export async function judgeContradiction(
   llm: InternalLlm,
@@ -205,7 +211,13 @@ export async function judgeContradiction(
         return null
       }
       if (verdict === 'unrelated') return null
-      return { verdict, againstId: neighbors[index]!.id }
+      const temporal = record.temporal
+      return {
+        verdict,
+        againstId: neighbors[index]!.id,
+        // 缺省/非法按 overlapping：P0 安全网语义不变（宁软失效不错过取代）
+        temporal: verdict === 'contradicts' ? (temporal === 'disjoint' ? 'disjoint' : 'overlapping') : undefined,
+      }
     },
     signal,
   )

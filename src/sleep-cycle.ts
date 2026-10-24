@@ -26,6 +26,7 @@ import {
   lexicalDensities,
 } from './judges.js'
 import { cosine, mean, qaF1, sigmoid, zScore } from './metrics.js'
+import { applyDecay, applyNodeDecay } from './scoring.js'
 import type {
   EmbeddingProvider,
   InternalLlm,
@@ -266,20 +267,31 @@ export class SleepCycle {
       }
     }
 
-    // 第 7 步：刷新 r_m / red（留情景层者）与节点 r_m（检索宇宙内）
+    // 第 7 步：兜底衰减（§2.1，P2）+ 刷新 r_m / red（留情景层者）与节点 r_m
+    // （检索宇宙内）。衰减只作用于仍在检索宇宙的记录/节点（软失效与已压缩
+    // 归档者的 S 是惰性值，不参与分层）；衰减引起的层级跃迁不触发 M5 重判。
+    const now = this.deps.now ?? Date.now
     const remaining = this.deps.store
       .validMemories()
       .filter((r) => r.flags.compressed_into === undefined)
     for (const record of remaining) {
+      await this.deps.store.updateRecord(record.id, (r) => applyDecay(r, now(), this.deps.config))
       await this.deps.store.refreshNeighborhood(record.id, config.retrieval.cslsK)
     }
     const refreshedNodes: string[] = []
     for (const node of this.deps.store.validNodes()) {
+      await this.deps.store.putNode(applyNodeDecay(node, now(), this.deps.config))
       await this.deps.store.refreshNodeNeighborhood(node.id, config.retrieval.cslsK)
       refreshedNodes.push(node.id)
     }
 
-    return { clusters: outcomes, refreshedRecords: remaining.length, refreshedNodes }
+    return {
+      clusters: outcomes,
+      refreshedRecords: remaining.length,
+      refreshedNodes,
+      decayedRecords: remaining.length,
+      decayedNodes: refreshedNodes.length,
+    }
   }
 
   /**
@@ -335,7 +347,7 @@ export class SleepCycle {
     if (nodes.length === 0) {
       // 空网络引导：无条件建首节点，否则语义层永不为空（P1 政策，设计未定义空网情形）
       const nodeId = await this.createNode(gist, gistVector, gistEpi, memberIds, memberMeanImp, now())
-      await this.compressMembers(memberIds, nodeId, 'new_node')
+      await this.compressMembers(memberIds, nodeId, 'new_node', now())
       return { members: memberIds, gist, qaF1: qaMean, gistEpi, memberMeanEpi, route: 'new_node', nodeId }
     }
     const { con, attachTo } = conAgainstBaseline(gistVector, nodes, pool, cfg.conWindow)
@@ -346,16 +358,16 @@ export class SleepCycle {
         await this.deps.store.putNode({
           ...attachTo,
           member_refs: [...attachTo.member_refs, ...memberIds],
-          S: attachTo.S + cfg.attachGain, // §2.1 α 沿用的强化增益；完整 S 动态在 P2
+          S: attachTo.S + cfg.attachGain, // §2.1 α 沿用的强化增益；使用/抑制/衰减动态见 scoring.ts
         })
-        await this.compressMembers(memberIds, attachTo.id, 'attached')
+        await this.compressMembers(memberIds, attachTo.id, 'attached', now())
         return { members: memberIds, gist, qaF1: qaMean, gistEpi, memberMeanEpi, route: 'attached', nodeId: attachTo.id }
       }
       return { members: memberIds, gist, qaF1: qaMean, gistEpi, memberMeanEpi, route: 'stayed' }
     }
     if (con < cfg.conNewNodeSigma && memberMeanImp >= cfg.conNewNodeMinImp) {
       const nodeId = await this.createNode(gist, gistVector, gistEpi, memberIds, memberMeanImp, now())
-      await this.compressMembers(memberIds, nodeId, 'new_node')
+      await this.compressMembers(memberIds, nodeId, 'new_node', now())
       return { members: memberIds, gist, qaF1: qaMean, gistEpi, memberMeanEpi, route: 'new_node', nodeId }
     }
     // 其余：留情景层，等下个巩固周期（§3.4 表第 3 行）
@@ -397,15 +409,17 @@ export class SleepCycle {
     return id
   }
 
-  /** §2.3 第 6 步：成员压缩归档 —— 指向 gist、退出检索，仅保留回溯索引。 */
+  /** §2.3 第 6 步：成员压缩归档 —— 指向 gist、记录归档时点（时间旅行视图消费）、退出检索，仅保留回溯索引。 */
   private async compressMembers(
     memberIds: readonly string[],
     nodeId: string,
     routeKind: 'new_node' | 'attached',
+    at: number,
   ): Promise<void> {
     for (const id of memberIds) {
       await this.deps.store.updateRecord(id, (r) => ({
         ...r,
+        time_meta: { ...r.time_meta, compressed_at: at },
         flags: { ...r.flags, compressed_into: nodeId, qa_passed: true },
         con_route:
           routeKind === 'new_node'

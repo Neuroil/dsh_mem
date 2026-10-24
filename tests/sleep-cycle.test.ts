@@ -37,6 +37,7 @@ const BASE_CONFIG: Config = {
   write: { messageWindow: 10, maxCandidates: 8, minImportance: 3, contradictionTopK: 5, contradictionMinCos: 0.8 },
   retrieval: { l0TopK: 100, cslsTopK: 20, rerankTopK: 8, mmrTopK: 5, mmrLambda: 0.6, cslsK: 10, contextTurns: 3, coldCueBoost: 0.1, cueThreshold: 0.3 },
   tier: { hotThreshold: 8, coldThreshold: 2 },
+  score: { useGain: 0.5, suppressPenalty: 0.05, decayTauDays: 180, rejudgeEma: 0.5 },
   sleep: {
     enabled: true, minNewMemories: 10, clusterCos: 0.75, clusterMinSize: 3, qaPairCount: 3,
     qaF1Threshold: 0.8, epiThreshold: 0.5, conWindow: 1000, conAttachSigma: 0.5,
@@ -503,6 +504,7 @@ describe('SleepCycle.run', () => {
     const cycle = new SleepCycle({
       llm, embedding: provider, store,
       config: withSleep({ epiThreshold: 0.99, attachGain: 2.5 }), // 覆写增益更直观：S 应 +2.5
+      now: () => 900, // 与节点锚点同刻：第 7 步兜底衰减不介入，S 断言只反映 attachGain
     })
     return { store, llm, cycle }
   }
@@ -609,6 +611,7 @@ describe('SleepCycle.run', () => {
     const cycle = new SleepCycle({
       llm, embedding: provider, store,
       config: withSleep({ epiThreshold: 0.99 }), newId: () => 'node-2',
+      now: () => 900, // 与锚点同刻：衰减不介入，S 断言只反映建节点初值
     })
     return { store, llm, cycle }
   }
@@ -684,7 +687,10 @@ describe('SleepCycle.run', () => {
 
     const outcome = await cycle.run()
 
-    expect(outcome).toEqual({ clusters: [], refreshedRecords: 2, refreshedNodes: [] })
+    expect(outcome).toEqual({
+      clusters: [], refreshedRecords: 2, refreshedNodes: [],
+      decayedRecords: 2, decayedNodes: 0,
+    })
     expect(llm.calls).toHaveLength(0)
     expect(embed.mock.calls).toHaveLength(0) // 探针嵌入只在有簇时发生
     expect(store.refreshed).toEqual([{ id: 'm1', k: 10 }, { id: 'm2', k: 10 }])
@@ -740,5 +746,48 @@ describe('SleepCycle.run', () => {
     expect(store.refreshed.map((x) => x.id)).toEqual(['a1', 'a2', 'a3'])
     expect(outcome.refreshedNodes).toEqual(['node-1'])
     expect(llm.calls).toHaveLength(5) // 甲耗 2 次 + 乙 3 次（1 gist + 1 生成 + 1 作答）
+  })
+
+  it('第 7 步兜底衰减（P2 §2.1）：留层记录与节点 S·e^(−Δt/τ)、tier 重算、锚点前移；已压缩记录不动', async () => {
+    const store = new FakeStore()
+    // 距 now 180 天的两条记录：m1 未压缩（衰减）、m2 已压缩（不动）；节点同样衰减
+    const old = 1_000
+    const now = old + 180 * 24 * 3600 * 1000
+    store.records.set('m1', makeRecord({ id: 'm1', S: 5, tier: 'warm' }))
+    store.records.set('m2', makeRecord({ id: 'm2', S: 5, flags: { compressed_into: 'n0' } }))
+    store.nodes.set('n1', makeNode({ id: 'n1', S: 4, time_meta: { created_at: old, valid_at: old } }))
+    // 池只有 1 条未压缩记录 < clusterMinSize → 无簇路径，衰减照常执行
+    const { provider } = makeEmbedding()
+    const cycle = new SleepCycle({ llm: new FakeLlm([]), embedding: provider, store, config: BASE_CONFIG, now: () => now })
+
+    const outcome = await cycle.run()
+
+    expect(outcome.decayedRecords).toBe(1)
+    expect(outcome.decayedNodes).toBe(1)
+    expect(store.records.get('m1')!.S).toBeCloseTo(5 * Math.exp(-1), 10)
+    expect(store.records.get('m1')!.tier).toBe('cold') // 1.84 < 2
+    expect(store.records.get('m1')!.counters.last_decay_at).toBe(now)
+    expect(store.records.get('m2')!.S).toBe(5) // 已压缩：S 惰性，不参与分层
+    expect(store.nodes.get('n1')!.S).toBeCloseTo(4 * Math.exp(-1), 10)
+    expect(store.nodes.get('n1')!.counters?.last_decay_at).toBe(now)
+  })
+
+  it('迁移成员带 time_meta.compressed_at 归档时点（时间旅行视图消费，§2.5）', async () => {
+    const store = new FakeStore()
+    for (let i = 1; i <= 3; i++) store.records.set(`m${i}`, makeRecord({ id: `m${i}` }))
+    const gistText = '用户偏好简洁直接的回复'
+    const llm = new FakeLlm([
+      gistReply(gistText),
+      ...qaPerfect([{ q: '用户偏好怎样的回复？', a: '简洁' }]),
+    ])
+    const { provider } = makeEmbedding({ [gistText]: unit(0) })
+    const at = 123_456
+    const cycle = new SleepCycle({ llm, embedding: provider, store, config: withSleep({ epiThreshold: 0.99 }), now: () => at })
+
+    await cycle.run()
+
+    for (const id of ['m1', 'm2', 'm3']) {
+      expect(store.records.get(id)!.time_meta.compressed_at).toBe(at)
+    }
   })
 })

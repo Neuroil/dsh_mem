@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { WritePipeline, type MemoryStoreLike } from '../src/write-path.js'
 import type { Config } from '../src/config.js'
-import type { EmbeddingProvider, InternalLlm, MemoryRecord } from '../src/types.js'
+import type { EmbeddingProvider, InternalLlm, MemoryRecord, SemanticNode } from '../src/types.js'
 
 const config: Config = {
   storage: { backend: 'json', unit: 'dsh-mem', version: 1 },
@@ -11,6 +11,7 @@ const config: Config = {
   write: { messageWindow: 10, maxCandidates: 8, minImportance: 3, contradictionTopK: 5, contradictionMinCos: 0.8 },
   retrieval: { l0TopK: 100, cslsTopK: 20, rerankTopK: 8, mmrTopK: 5, mmrLambda: 0.6, cslsK: 10, contextTurns: 3, coldCueBoost: 0.1, cueThreshold: 0.3 },
   tier: { hotThreshold: 8, coldThreshold: 2 },
+  score: { useGain: 0.5, suppressPenalty: 0.05, decayTauDays: 180, rejudgeEma: 0.5 },
   sleep: { enabled: true, minNewMemories: 10, clusterCos: 0.75, clusterMinSize: 3, qaPairCount: 3, qaF1Threshold: 0.8, epiThreshold: 0.5, conWindow: 1000, conAttachSigma: 0.5, conNewNodeSigma: -1, conNewNodeMinImp: 7, attachGain: 0.5 },
   section: { enabled: true, maxMemories: 5, header: 'memories:' },
   tool: { enabled: true, maxResults: 5 },
@@ -32,14 +33,31 @@ function makeRecord(over: Partial<MemoryRecord> = {}): MemoryRecord {
   }
 }
 
+function makeNode(over: Partial<SemanticNode> = {}): SemanticNode {
+  return {
+    id: over.id ?? 'node-1',
+    gist: over.gist ?? 'node gist',
+    embedding: over.embedding ?? [1, 0, 0, 0, 0, 0, 0, 0],
+    epi: 0, links: [], member_refs: [],
+    time_meta: { created_at: 1_000, valid_at: 1_000 },
+    S: 5, r_m: 0,
+    ...over,
+  }
+}
+
 /** 记录调用序的假存储。 */
 class FakeStore implements MemoryStoreLike {
   readonly records = new Map<string, MemoryRecord>()
+  readonly nodes = new Map<string, SemanticNode>()
   readonly softInvalidations: Array<{ id: string; by: string }> = []
+  readonly nodeInvalidations: Array<{ id: string; by: string }> = []
   readonly refreshed: string[] = []
   similarCalls: number = 0
+  similarNodesCalls: number = 0
   /** 控制 similar() 返回什么；为空时对已入库记录算真实余弦（与 MemoryStore 语义一致）。 */
   nextNeighbors: Array<{ id: string; cos: number; record: MemoryRecord }> = []
+  /** 控制 similarNodes() 返回什么。 */
+  nextNodeNeighbors: Array<{ id: string; cos: number; node: SemanticNode }> = []
 
   validMemories(): readonly MemoryRecord[] { return [...this.records.values()] }
   similar(vector: readonly number[], _k: number): readonly { id: string; cos: number; record: MemoryRecord }[] {
@@ -49,8 +67,20 @@ class FakeStore implements MemoryStoreLike {
       .map((record) => ({ id: record.id, cos: cosine(vector, record.embedding), record }))
       .sort((a, b) => b.cos - a.cos)
   }
+  similarNodes(vector: readonly number[], _k: number): readonly { id: string; cos: number; node: SemanticNode }[] {
+    this.similarNodesCalls++
+    if (this.nextNodeNeighbors.length > 0) return this.nextNodeNeighbors
+    return [...this.nodes.values()]
+      .map((node) => ({ id: node.id, cos: cosine(vector, node.embedding), node }))
+      .sort((a, b) => b.cos - a.cos)
+  }
   async putRecord(record: MemoryRecord): Promise<void> { this.records.set(record.id, record) }
-  async softInvalidate(id: string, by: string): Promise<void> { this.softInvalidations.push({ id, by }) }
+  async softInvalidate(id: string, by: string, _at: number): Promise<void> { this.softInvalidations.push({ id, by }) }
+  async softInvalidateNode(id: string, by: string, _at: number): Promise<void> {
+    this.nodeInvalidations.push({ id, by })
+    const node = this.nodes.get(id)
+    if (node) this.nodes.set(id, { ...node, time_meta: { ...node.time_meta, invalid_at: 1 }, superseded_by: by })
+  }
   async refreshNeighborhood(id: string): Promise<{ r_m: number; red: number }> {
     this.refreshed.push(id)
     const record = this.records.get(id)
@@ -303,5 +333,92 @@ describe('WritePipeline.processTurn', () => {
     expect(outcome.written.length).toBe(1)
     expect(outcome.dropped).toBe(1)
     expect(store.records.size).toBe(1)
+  })
+})
+
+describe('WritePipeline.processTurn 矛盾判定完整版（§2.5，P2）', () => {
+  it('contradicts + temporal=disjoint：两条都真（不同时期），不软失效、不建链、照常入库', async () => {
+    const store = new FakeStore()
+    const existing = makeRecord({ id: 'old-1', text: '用户 2024 年默认数据库是 MySQL' })
+    store.nextNeighbors = [{ id: 'old-1', cos: 0.93, record: existing }]
+    const llm = new FakeLlm([
+      '["用户现在默认数据库是 PostgreSQL"]',
+      ...importances(7),
+      '{"index":0,"verdict":"contradicts","temporal":"disjoint"}',
+    ])
+    const pipeline = new WritePipeline({ llm, embedding, store, config, now: () => 2000 })
+    const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
+
+    expect(store.softInvalidations).toEqual([])
+    expect(store.nodeInvalidations).toEqual([])
+    expect(outcome.superseded).toEqual([])
+    expect(outcome.written.length).toBe(1)
+    expect(outcome.written[0]!.links).toEqual([]) // 不建链
+  })
+
+  it('contradicts + temporal 缺省：按 overlapping 处理（P0 语义保持），软失效旧记录', async () => {
+    const store = new FakeStore()
+    const existing = makeRecord({ id: 'old-1', text: '用户默认数据库是 MySQL' })
+    store.nextNeighbors = [{ id: 'old-1', cos: 0.93, record: existing }]
+    const llm = new FakeLlm([
+      '["用户把默认数据库换成了 PostgreSQL"]',
+      ...importances(7),
+      '{"index":0,"verdict":"contradicts"}', // 无 temporal 字段
+    ])
+    const pipeline = new WritePipeline({ llm, embedding, store, config })
+    const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
+    expect(store.softInvalidations).toEqual([{ id: 'old-1', by: outcome.written[0]!.id }])
+  })
+
+  it('contradicts 指向语义节点 gist：节点软失效、新记录建 supersedes 链', async () => {
+    const store = new FakeStore()
+    const node = makeNode({ id: 'node-1', gist: '用户偏好用 PostgreSQL 作为生产数据库' })
+    store.nodes.set('node-1', node)
+    store.nextNodeNeighbors = [{ id: 'node-1', cos: 0.95, node }]
+    const llm = new FakeLlm([
+      '["用户已把生产数据库迁移到 MySQL"]',
+      ...importances(8),
+      '{"index":0,"verdict":"contradicts","temporal":"overlapping"}',
+    ])
+    const pipeline = new WritePipeline({ llm, embedding, store, config, now: () => 3000 })
+    const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
+
+    expect(store.nodeInvalidations).toEqual([{ id: 'node-1', by: outcome.written[0]!.id }])
+    expect(store.softInvalidations).toEqual([]) // 记录侧不动
+    expect(outcome.superseded).toEqual([{ id: 'node-1', by: outcome.written[0]!.id }])
+    expect(outcome.written[0]!.links).toEqual([{ kind: 'supersedes', target: 'node-1' }])
+    // 节点退出检索宇宙（FakeStore.softInvalidateNode 已置 invalid_at）
+    expect(store.nodes.get('node-1')!.time_meta.invalid_at).toBe(1)
+  })
+
+  it('近邻送判顺序：记录在前、节点在后（index 跨表寻址确定性）', async () => {
+    const store = new FakeStore()
+    const existing = makeRecord({ id: 'rec-1', text: '用户在维护数据库迁移工具' })
+    const node = makeNode({ id: 'node-1', gist: '用户重视数据完整性' })
+    store.nextNeighbors = [{ id: 'rec-1', cos: 0.9, record: existing }]
+    store.nextNodeNeighbors = [{ id: 'node-1', cos: 0.95, node }]
+    const llm = new FakeLlm([
+      '["用户为迁移工具补了数据校验"]',
+      ...importances(6),
+      '{"index":1,"verdict":"complements"}', // index=1 → 第二项 = 节点
+    ])
+    const pipeline = new WritePipeline({ llm, embedding, store, config })
+    const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
+    const listing = llm.completions[2]!.user // 第三次调用 = 矛盾判定
+    expect(listing.split('EXISTING memories:')[1]!.startsWith('\n0. 用户在维护数据库迁移工具')).toBe(true)
+    expect(listing).toContain('1. 用户重视数据完整性')
+    expect(outcome.written[0]!.links).toEqual([{ kind: 'complements', target: 'node-1' }])
+  })
+
+  it('节点 gist 低于 contradictionMinCos 不送判（安全网阈值对节点同样生效）', async () => {
+    const store = new FakeStore()
+    const node = makeNode({ id: 'node-1', gist: '无关节点' })
+    store.nextNodeNeighbors = [{ id: 'node-1', cos: 0.5, node }]
+    store.nextNeighbors = []
+    const llm = new FakeLlm(['["候选"]', ...importances(6)]) // 无第三次调用
+    const pipeline = new WritePipeline({ llm, embedding, store, config })
+    const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
+    expect(outcome.written.length).toBe(1)
+    expect(llm.completions.length).toBe(2)
   })
 })

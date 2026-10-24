@@ -24,9 +24,10 @@ import { CordisLlm } from './llm.js'
 import { MemoryStore, memoryUnitDescriptor } from './memory-store.js'
 import { createVectorIndex } from './vector-store.js'
 import { buildExpandedQuery, MemoryRetriever } from './retrieval.js'
+import { ScoreKeeper } from './scoring.js'
 import { SleepCycle } from './sleep-cycle.js'
 import type { Config } from './config.js'
-import type { MemoryRecord, RetrievalResult } from './types.js'
+import type { RetrievalResult } from './types.js'
 import { WritePipeline } from './write-path.js'
 import { createMemorySearchTool, formatMemories } from './tool.js'
 
@@ -68,6 +69,7 @@ export class MemoryRuntime {
   private retriever!: MemoryRetriever
   private write!: WritePipeline
   private sleep!: SleepCycle
+  private scores!: ScoreKeeper
   private started = false
   /** 自上次睡眠周期后新写入的记忆数（§5.3 turn/end 信号门控）。 */
   private newSinceSleep = 0
@@ -109,16 +111,24 @@ export class MemoryRuntime {
       lookup: this.store,
       config: this.config.retrieval,
     })
+    // 三条内部链路共用同一 ctx.llm 路由（CordisLlm 无调用间状态）
+    const llm = new CordisLlm(this.ctx, this.config.llm)
     this.write = new WritePipeline({
-      llm: new CordisLlm(this.ctx, this.config.llm),
+      llm,
       embedding,
       store: this.store,
       config: this.config,
       log: (msg) => this.log(msg),
     })
     this.sleep = new SleepCycle({
-      llm: new CordisLlm(this.ctx, this.config.llm),
+      llm,
       embedding,
+      store: this.store,
+      config: this.config,
+      log: (msg) => this.log(msg),
+    })
+    this.scores = new ScoreKeeper({
+      llm,
       store: this.store,
       config: this.config,
       log: (msg) => this.log(msg),
@@ -131,7 +141,7 @@ export class MemoryRuntime {
       this.ctx.tools.register(createMemorySearchTool({
         retriever: this.retriever,
         recentTurns: (agent) => this.recentTurnsFor(agent),
-        onRetrieved: (result) => void this.recordUse(result),
+        onRetrieved: (result) => void this.scores.recordRetrieval(result),
         config: this.config,
       }))
     }
@@ -255,42 +265,9 @@ export class MemoryRuntime {
         topK: this.config.section.maxMemories,
       })
       state.lastExpandedQuery = expanded
-      void this.recordUse(state.lastResult)
+      void this.scores.recordRetrieval(state.lastResult)
     }
     return formatMemories(state.lastResult, this.config.section.maxMemories, this.config.section.header)
-  }
-
-  /** Weak-form usage accounting (§2.2/§3.2): winners gain use events, stage losers gain suppression counts. */
-  private async recordUse(result: RetrievalResult): Promise<void> {
-    if (!this.started) return
-    const now = Date.now()
-    const bump = async (id: string, fn: (record: MemoryRecord) => MemoryRecord) => {
-      try {
-        await this.store.updateRecord(id, fn)
-      } catch {
-        // Record may have been superseded between retrieval and accounting.
-      }
-    }
-    // 语义节点无 counters（S 完整动态在 P2）：只对情景层记账
-    for (const winner of result.top) {
-      if (winner.item.layer !== 'episodic') continue
-      await bump(winner.id, (record) => ({
-        ...record,
-        counters: {
-          ...record.counters,
-          used_count: record.counters.used_count + 1,
-          last_used_at: now,
-          last_cue_quality: winner.cue ?? record.counters.last_cue_quality,
-        },
-      }))
-    }
-    for (const loser of result.suppressed) {
-      if (loser.item.layer !== 'episodic') continue
-      await bump(loser.id, (record) => ({
-        ...record,
-        counters: { ...record.counters, suppressed_count: record.counters.suppressed_count + 1 },
-      }))
-    }
   }
 
   // ---- offline consolidation cycle ("sleep", §2.3/§5.3) ----
@@ -315,7 +292,8 @@ export class MemoryRuntime {
         const gated = outcome.clusters.filter((c) => c.route === 'qa_failed' || c.route === 'epi_failed').length
         this.log(
           `sleep cycle: ${outcome.clusters.length} clusters (${migrated} migrated, ${gated} gated), ` +
-          `refreshed ${outcome.refreshedRecords} records / ${outcome.refreshedNodes.length} nodes`,
+          `refreshed ${outcome.refreshedRecords} records / ${outcome.refreshedNodes.length} nodes, ` +
+          `decayed ${outcome.decayedRecords} records / ${outcome.decayedNodes} nodes`,
         )
       })
       .catch((err) => this.log('sleep cycle failed', err))

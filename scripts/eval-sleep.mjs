@@ -59,6 +59,7 @@ const config = {
     cslsK: 10, contextTurns: 0, coldCueBoost: 0.1, cueThreshold: 0.3,
   },
   tier: { hotThreshold: 8, coldThreshold: 2 },
+  score: { useGain: 0.5, suppressPenalty: 0.05, decayTauDays: 180, rejudgeEma: 0.5 },
   sleep: {
     enabled: true,
     minNewMemories: 10,

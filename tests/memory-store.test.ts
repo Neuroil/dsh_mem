@@ -19,6 +19,7 @@ const testConfig = (): Config => ({
   write: { messageWindow: 10, maxCandidates: 8, minImportance: 3, contradictionTopK: 5, contradictionMinCos: 0.8 },
   retrieval: { l0TopK: 100, cslsTopK: 20, rerankTopK: 8, mmrTopK: 5, mmrLambda: 0.6, cslsK: 10, contextTurns: 3, coldCueBoost: 0.1, cueThreshold: 0.3 },
   tier: { hotThreshold: 8, coldThreshold: 2 },
+  score: { useGain: 0.5, suppressPenalty: 0.05, decayTauDays: 180, rejudgeEma: 0.5 },
   sleep: { enabled: true, minNewMemories: 10, clusterCos: 0.75, clusterMinSize: 3, qaPairCount: 3, qaF1Threshold: 0.8, epiThreshold: 0.5, conWindow: 1000, conAttachSigma: 0.5, conNewNodeSigma: -1, conNewNodeMinImp: 7, attachGain: 0.5 },
   section: { enabled: true, maxMemories: 5, header: 'memories:' },
   tool: { enabled: true, maxResults: 5 },
@@ -453,6 +454,98 @@ describe('MemoryStore 语义层节点（P1 睡眠周期填充）', () => {
   it('refreshNodeNeighborhood 对不存在的 id 抛错', async () => {
     const { store } = await open()
     await expect(store.refreshNodeNeighborhood('nope', 5)).rejects.toThrow('node not found')
+    await store.close()
+  })
+})
+
+describe('MemoryStore 语义节点软失效与近邻（支柱五完整版，P2）', () => {
+  it('similarNodes：有效节点按余弦返回，排除软失效节点与记录', async () => {
+    const { store } = await open()
+    await store.putNode(makeNode('n1', [1, 0]))
+    await store.putNode(makeNode('n2', [0.6, 0.8]))
+    await store.putNode(makeNode('dead', [1, 0], { time_meta: { created_at: 1, valid_at: 1, invalid_at: 9 } }))
+    await store.putRecord(makeRecord({ id: 'r1', embedding: [1, 0] }))
+    const hits = store.similarNodes([1, 0.1], 10)
+    expect(hits.map((h) => h.id)).toEqual(['n1', 'n2'])
+    expect(hits[0]!.cos).toBeGreaterThan(hits[1]!.cos)
+    expect(hits[0]!.node.id).toBe('n1')
+    await store.close()
+  })
+
+  it('softInvalidateNode：退出索引与检索宇宙、保留存储、幂等、写 superseded_by；重开后仍可读', async () => {
+    const { backing, open } = await makeEnv()
+    {
+      const { index, store } = await open()
+      await store.putNode(makeNode('n1', [1, 0]))
+      await store.putRecord(makeRecord({ id: 'r1', embedding: [0, 1] }))
+      await store.softInvalidateNode('n1', 'r2', 4242)
+      expect(store.getNode('n1')?.time_meta.invalid_at).toBe(4242)
+      expect(store.getNode('n1')?.superseded_by).toBe('r2')
+      expect(store.validNodes()).toHaveLength(0)
+      expect(store.retrievable().map((i) => i.id)).toEqual(['r1'])
+      expect(index.size()).toBe(1) // 只剩 r1
+      // 幂等：重复调用不抛、保持首次时间戳
+      await store.softInvalidateNode('n1', 'other', 9999)
+      expect(store.getNode('n1')?.time_meta.invalid_at).toBe(4242)
+      await store.close()
+    }
+    const { store: store2 } = await open()
+    expect(store2.getNode('n1')?.superseded_by).toBe('r2')
+    expect(store2.validNodes()).toHaveLength(0)
+    await store2.close()
+  })
+
+  it('softInvalidateNode 对不存在的 id 抛错', async () => {
+    const { store } = await open()
+    await expect(store.softInvalidateNode('nope', 'x', 1)).rejects.toThrow('node not found')
+    await store.close()
+  })
+})
+
+describe('MemoryStore retrievableAt（时间旅行，§2.5 完整版）', () => {
+  it('有效性窗口重建：valid_at ≤ t < invalid_at 的记录在列，窗口外不在', async () => {
+    const { store } = await open()
+    await store.putRecord(makeRecord({ id: 'live', embedding: [1, 0] })) // valid 1000 →
+    await store.putRecord(makeRecord({ id: 'old', embedding: [1, 0], time_meta: { created_at: 500, valid_at: 500, invalid_at: 900 } }))
+    await store.putRecord(makeRecord({ id: 'dying', embedding: [1, 0], time_meta: { created_at: 500, valid_at: 500, invalid_at: 1500 } }))
+    expect(store.retrievableAt(600).map((i) => i.id).sort()).toEqual(['dying', 'old'])
+    expect(store.retrievableAt(1000).map((i) => i.id).sort()).toEqual(['dying', 'live']) // invalid_at=1500 > 1000 仍在
+    expect(store.retrievableAt(1500).map((i) => i.id)).toEqual(['live']) // invalid_at ≤ t 排除
+    expect(store.retrievableAt(400)).toEqual([]) // valid_at 500 > 400
+    await store.close()
+  })
+
+  it('压缩时点重建：compressed_at ≤ t 排除、compressed_at > t 仍在；当前视图恒排除', async () => {
+    const { store } = await open()
+    await store.putRecord(makeRecord({
+      id: 'r1', embedding: [1, 0],
+      time_meta: { created_at: 500, valid_at: 500, compressed_at: 1200 },
+      flags: { compressed_into: 'n1' }, // 迁移时 flags 与 compressed_at 同笔写入
+    }))
+    await store.putNode(makeNode('n1', [0, 1], { time_meta: { created_at: 1300, valid_at: 1300 } }))
+    expect(store.retrievableAt(1100).map((i) => i.id)).toEqual(['r1']) // 压缩前：记录还在
+    expect(store.retrievableAt(1250)).toEqual([]) // 记录已压缩、节点未创建：间隙期
+    expect(store.retrievableAt(1400).map((i) => i.id)).toEqual(['n1'])
+    expect(store.retrievable().map((i) => i.id)).toEqual(['n1']) // 当前视图：压缩记录退出
+    await store.close()
+  })
+
+  it('P1 遗留归档（compressed_into 无 compressed_at）：保守视为历来已压缩，任何时点不复活', async () => {
+    const { store } = await open()
+    await store.putRecord(makeRecord({ id: 'legacy', embedding: [1, 0], flags: { compressed_into: 'n1' } }))
+    expect(store.retrievableAt(1000)).toEqual([])
+    await store.close()
+  })
+
+  it('节点窗口：valid_at ≤ t < invalid_at；软失效节点在失效前时点仍可检索', async () => {
+    const { store } = await open()
+    await store.putNode(makeNode('n1', [1, 0], { time_meta: { created_at: 1000, valid_at: 1000, invalid_at: 2000 } }))
+    await store.putNode(makeNode('n2', [0, 1], { time_meta: { created_at: 1000, valid_at: 1000 } }))
+    expect(store.retrievableAt(1500).map((i) => i.id).sort()).toEqual(['n1', 'n2']) // n1 于 2000 失效，1500 时仍有效
+    expect(store.retrievableAt(2500).map((i) => i.id)).toEqual(['n2'])
+    await store.softInvalidateNode('n2', 'x', 3000)
+    expect(store.retrievableAt(2999).map((i) => i.id)).toEqual(['n2']) // 失效前的时点仍可检索（时间旅行语义）
+    expect(store.retrievableAt(3000).map((i) => i.id)).toEqual([]) // 失效时点起排除
     await store.close()
   })
 })

@@ -44,6 +44,13 @@ export interface SimilarMemory {
   readonly record: MemoryRecord
 }
 
+/** 有效语义节点的近邻命中项（支柱五完整版：gist 被新记忆推翻的安全网）。 */
+export interface SimilarNodeHit {
+  readonly id: string
+  readonly cos: number
+  readonly node: SemanticNode
+}
+
 /** episodic 表名（MemoryRecord）。 */
 const TABLE_EPISODIC = 'episodic'
 /** semantic 表名（SemanticNode）。 */
@@ -62,6 +69,11 @@ function isValidRecord(record: MemoryRecord): boolean {
 /** 语义节点是否仍有效（§4.2 同款双时间戳语义）。 */
 function isValidNode(node: SemanticNode): boolean {
   return node.time_meta?.invalid_at === undefined
+}
+
+/** 记录/节点在时点 t 是否有效（时间旅行视图，§2.5 完整版）：valid_at ≤ t < invalid_at。 */
+function validAt(timeMeta: { valid_at: number; invalid_at?: number }, t: number): boolean {
+  return timeMeta.valid_at <= t && (timeMeta.invalid_at === undefined || timeMeta.invalid_at > t)
 }
 
 /** 记录是否已压缩归档（§2.3 第 6 步：内容已由语义节点承载，退出检索）。 */
@@ -252,6 +264,23 @@ export class MemoryStore {
     return hits
   }
 
+  /**
+   * 有效语义节点的近邻检索（支柱五完整版，P2）：写入路径矛盾判定的第二路
+   * 安全网——被新记忆推翻的 gist 也走软失效，不再永留检索宇宙。
+   */
+  similarNodes(vector: readonly number[], k: number): readonly SimilarNodeHit[] {
+    const hits: SimilarNodeHit[] = []
+    const neighbors: readonly Neighbor[] = this.index.search(vector, k, (id) => {
+      const node = this.nodes.get(id)
+      return node !== undefined && isValidNode(node)
+    })
+    for (const n of neighbors) {
+      const node = this.nodes.get(n.id)
+      if (node !== undefined) hits.push({ id: n.id, cos: n.cos, node })
+    }
+    return hits
+  }
+
   /** id 是否属于检索宇宙（§5.2 L0 池）：有效未压缩记录或有效语义节点。 */
   private isRetrievable(id: string): boolean {
     const record = this.records.get(id)
@@ -270,29 +299,63 @@ export class MemoryStore {
     const items: RetrievableItem[] = []
     for (const record of this.records.values()) {
       if (!isValidRecord(record) || isCompressed(record)) continue
-      items.push({
-        id: record.id,
-        text: record.text,
-        embedding: record.embedding,
-        r_m: record.r_m,
-        tier: record.tier,
-        createdAt: record.time_meta.created_at,
-        layer: 'episodic',
-      })
+      items.push(this.toRetrievableRecord(record))
     }
     for (const node of this.nodes.values()) {
       if (!isValidNode(node)) continue
-      items.push({
-        id: node.id,
-        text: node.gist,
-        embedding: node.embedding,
-        r_m: node.r_m,
-        tier: tierOf(node.S, this.config.tier),
-        createdAt: node.time_meta.created_at,
-        layer: 'semantic',
-      })
+      items.push(this.toRetrievableNode(node))
     }
     return items
+  }
+
+  /**
+   * 时点 t 的检索宇宙（时间旅行，§2.5 完整版）：valid_at ≤ t < invalid_at 的
+   * 记录（且当时未压缩——compressed_at 未设或晚于 t）+ 当时有效的语义节点。
+   * P1 遗留的已归档记录没有 compressed_at：保守视为"历来已压缩"（无法定
+   * 期的归档不复活）。近似边界：tier / r_m / 节点 gist 取当前落盘快照，历史
+   * S 与邻域不重建（有效性区间是精确重建，成员集历史不重建）。
+   */
+  retrievableAt(t: number): readonly RetrievableItem[] {
+    const items: RetrievableItem[] = []
+    for (const record of this.records.values()) {
+      if (!validAt(record.time_meta, t)) continue
+      const compressedAt = record.flags?.compressed_into !== undefined
+        ? (record.time_meta.compressed_at ?? Number.NEGATIVE_INFINITY)
+        : record.time_meta.compressed_at
+      if (compressedAt !== undefined && compressedAt <= t) continue
+      items.push(this.toRetrievableRecord(record))
+    }
+    for (const node of this.nodes.values()) {
+      if (!validAt(node.time_meta, t)) continue
+      items.push(this.toRetrievableNode(node))
+    }
+    return items
+  }
+
+  /** 记录 → L0 候选视图（retrievable / retrievableAt 共用投影）。 */
+  private toRetrievableRecord(record: MemoryRecord): RetrievableItem {
+    return {
+      id: record.id,
+      text: record.text,
+      embedding: record.embedding,
+      r_m: record.r_m,
+      tier: record.tier,
+      createdAt: record.time_meta.created_at,
+      layer: 'episodic',
+    }
+  }
+
+  /** 节点 → L0 候选视图（tier 由 S 现算，不落盘）。 */
+  private toRetrievableNode(node: SemanticNode): RetrievableItem {
+    return {
+      id: node.id,
+      text: node.gist,
+      embedding: node.embedding,
+      r_m: node.r_m,
+      tier: tierOf(node.S, this.config.tier),
+      createdAt: node.time_meta.created_at,
+      layer: 'semantic',
+    }
   }
 
   /** 语义层节点写入（P1 睡眠周期填充）。先持久化再改镜像与索引。 */
@@ -302,6 +365,25 @@ export class MemoryStore {
     this.nodes.set(node.id, node)
     this.index.remove(node.id)
     if (isValidNode(node)) this.index.add(node.id, node.embedding)
+  }
+
+  /**
+   * 语义节点软失效（支柱五完整版，P2 / §2.5）：设 time_meta.invalid_at 与
+   * superseded_by，移出索引与检索宇宙，节点本体保留、永不删除。幂等：对已
+   * 失效节点重复调用是无操作、不抛；节点不存在时抛 Error。成员记录保持归档
+   * 状态（其内容仍由存储回溯，不经节点检索）。
+   */
+  async softInvalidateNode(id: string, supersededBy: string, at: number): Promise<void> {
+    this.assertOpen()
+    const current = this.nodes.get(id)
+    if (current === undefined) throw new Error(`node not found: ${id}`)
+    if (isValidNode(current)) {
+      await this.putNode({
+        ...current,
+        time_meta: { ...current.time_meta, invalid_at: at },
+        superseded_by: supersededBy,
+      })
+    }
   }
 
   getNode(id: string): SemanticNode | undefined {
