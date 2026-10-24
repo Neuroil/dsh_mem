@@ -1,7 +1,7 @@
 # dsh-mem — 语义驱动记忆插件（DeepSeek Harness）
 
 > 核心立场：**遗忘与巩固由语义而非时间决定。时间戳只作为元数据保存，永不作为衰减/删除的驱动。**
-> 设计文档：`design/语义驱动记忆系统设计.md`（定稿 v1.0）。本包实现其 **P0 + P1 + P2** 里程碑。
+> 设计文档：`docs/design/语义驱动记忆系统设计.md`（定稿 v1.0）。本包实现其 **P0 + P1 + P2** 里程碑。
 
 一句话：一个 Cordis 插件，监听会话日志，把值得记的内容（经 M5 rubric 判分）连同嵌入向量写入持久记忆库；每次模型请求前按语义检索（余弦召回 + CSLS + 精排 + MMR）注入最相关的记忆；矛盾的新记忆把旧记忆**或语义节点**软失效（不删除，且只对时间上重叠的矛盾生效）；每次记忆进入最终上下文都按线索质量巩固其分数 S、被竞争压制的按小权重衰减、睡眠周期对全库施加慢兜底衰减——S 决定 hot/warm/cold 分层而非删除；离线"睡眠"周期把冗余的情景簇蒸馏成语义 gist 节点（聚类 → gist → QA 闸门 → M4 路由 → M6 评估 → 迁移），原始记忆压缩归档；`memory_search` 支持 `at` 时间旅行参数，可检索任意历史时点的记忆状态。时间从不参与排序或删除决策（唯一例外是慢兜底衰减，且只影响分层、永不删除）。
 
@@ -97,6 +97,7 @@ turn/end 信号门控触发（自上次周期新写入 ≥ `sleep.minNewMemories
 | `scripts/eval-sleep.mjs` | P1 睡眠周期脚手架（QA 保留率、压缩后召回存续） |
 | `scripts/eval-semtime.mjs` | P2 语义 vs 时间消融脚手架（§7.4 关键消融 + 时间旅行） |
 | `data/` | 示例语料与查询集（格式见[评测](#评测ndcg-四档消融)） |
+| `docs/` | 设计文档（定稿）、`docs/architecture/插件工作原理全景图.md`（内部细节唯一引用点）、dsh 官方文档镜像 `docs/ref/`、立项认知机制对话 `1.md` |
 | `cordis.patch.yml` | 组合包 patch（`dsh plugin add` 时使用） |
 
 ### 6. 当前验证状态
@@ -152,7 +153,7 @@ npx @deepseek-ai/dsh web --patch ./overlay.yml   # --dump-config 可检查最终
 dsh plugin --profile web add C:/Users/you/Code/dsh_mem
 ```
 
-包身份来自 `package.json` 的 `dsh.bundle.patch` → `cordis.patch.yml`；`remove` 同步移除。git 安装的授权坑（pnpm ≥10 `allowBuilds`）见 ref/README。
+包身份来自 `package.json` 的 `dsh.bundle.patch` → `cordis.patch.yml`；`remove` 同步移除。git 安装的授权坑（pnpm ≥10 `allowBuilds`）见 docs/ref/README。
 
 ### 必要配置最小集
 
