@@ -11,7 +11,7 @@ import type { Config } from '../src/config.js'
 import type { RetrievalResult } from '../src/types.js'
 
 const config: Config = {
-  storage: { backend: 'json', unit: 'dsh_mem', version: 1 },
+  storage: { backend: 'json', unit: 'dsh_mem', version: 1, workspaceScope: false },
   embedding: { mode: 'deterministic', endpoint: '', model: '', apiKey: '', timeoutMs: 5_000, dimensions: 8, batchSize: 8 },
   reranker: { mode: 'deterministic', endpoint: '', model: '', apiKey: '', timeoutMs: 5_000 },
   llm: { provider: 'deepseek', model: 'deepseek-chat', temperature: 0, maxTokens: 2048 },
@@ -28,6 +28,15 @@ const config: Config = {
 function makeRetriever(result: RetrievalResult) {
   const retrieve = vi.fn(async () => result)
   return { retriever: { retrieve } as unknown as MemoryRetriever, retrieve }
+}
+
+/** 工具依赖替身（M2：resolve 按作用域返回检索/计分依赖；测试恒返回同一替身）。 */
+function makeDeps(retriever: ReturnType<typeof makeRetriever>['retriever'], onRetrieved: () => void = () => {}) {
+  return {
+    resolve: async () => ({ retriever, recordRetrieval: onRetrieved }),
+    recentTurns: () => [] as readonly string[],
+    config,
+  }
 }
 
 function emptyResult(): RetrievalResult {
@@ -58,7 +67,7 @@ describe('memory_search.execute', () => {
   it('无 at：正常检索、规范输出不带 at、onRetrieved 触发', async () => {
     const { retriever, retrieve } = makeRetriever(emptyResult())
     const onRetrieved = vi.fn()
-    const tool = createMemorySearchTool({ retriever, recentTurns: () => [], onRetrieved, config })
+    const tool = createMemorySearchTool(makeDeps(retriever, onRetrieved))
 
     const output = await tool.execute({ query: 'which database?' }, exec) as Record<string, unknown>
 
@@ -74,7 +83,7 @@ describe('memory_search.execute', () => {
   it('合法 at（ISO）：at 透传检索器并回显到规范输出', async () => {
     const at = Date.parse('2026-01-01T00:00:00Z')
     const { retriever, retrieve } = makeRetriever(emptyResult())
-    const tool = createMemorySearchTool({ retriever, recentTurns: () => [], onRetrieved: () => {}, config })
+    const tool = createMemorySearchTool(makeDeps(retriever))
 
     const output = await tool.execute({ query: '当时用什么数据库？', at: '2026-01-01T00:00:00Z' }, exec) as Record<string, unknown>
 
@@ -85,7 +94,7 @@ describe('memory_search.execute', () => {
   it('非法 at：不调检索器、规范 error 值（不抛异常）', async () => {
     const { retriever, retrieve } = makeRetriever(emptyResult())
     const onRetrieved = vi.fn()
-    const tool = createMemorySearchTool({ retriever, recentTurns: () => [], onRetrieved, config })
+    const tool = createMemorySearchTool(makeDeps(retriever, onRetrieved))
 
     const output = await tool.execute({ query: 'q', at: 'yesterday-ish' }, exec) as Record<string, unknown>
 
@@ -97,7 +106,7 @@ describe('memory_search.execute', () => {
 
   it('limit 覆盖默认条数（topK 透传）', async () => {
     const { retriever, retrieve } = makeRetriever(emptyResult())
-    const tool = createMemorySearchTool({ retriever, recentTurns: () => [], onRetrieved: () => {}, config })
+    const tool = createMemorySearchTool(makeDeps(retriever))
 
     await tool.execute({ query: 'q', limit: 3 }, exec)
 
@@ -106,7 +115,7 @@ describe('memory_search.execute', () => {
 
   it('limit < 1：不调检索器、规范 error 值（参数 DSL 无数值边界，领域级校验兜底）', async () => {
     const { retriever, retrieve } = makeRetriever(emptyResult())
-    const tool = createMemorySearchTool({ retriever, recentTurns: () => [], onRetrieved: () => {}, config })
+    const tool = createMemorySearchTool(makeDeps(retriever))
 
     const output = await tool.execute({ query: 'q', limit: 0 }, exec) as Record<string, unknown>
 
@@ -118,7 +127,7 @@ describe('memory_search.execute', () => {
 describe('render / formatMemories（规范值纯投影）', () => {
   it('error 值渲染为失败文本', async () => {
     const { retriever } = makeRetriever(emptyResult())
-    const tool = createMemorySearchTool({ retriever, recentTurns: () => [], onRetrieved: () => {}, config })
+    const tool = createMemorySearchTool(makeDeps(retriever))
     const output = await tool.execute({ query: 'q', at: 'nope' }, exec) as never
     const blocks = tool.output.render({ query: 'q', at: 'nope' }, output)
     expect(blocks[0]!.type).toBe('text')

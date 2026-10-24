@@ -9,11 +9,17 @@ import type { MemoryRetriever } from './retrieval.js'
 import type { Config } from './config.js'
 import type { MemoryTier, RetrievalResult, ScoredCandidate } from './types.js'
 
-export interface MemorySearchDeps {
+/** 按 agent 解析出的作用域内检索依赖（M2：检索与计分必须落在同一 scope）。 */
+export interface MemoryScopeDeps {
   readonly retriever: MemoryRetriever
+  /** 使用记账钩子（winners/suppressed counters），fire-and-forget。 */
+  readonly recordRetrieval: (result: RetrievalResult) => void
+}
+
+export interface MemorySearchDeps {
+  /** 由 agent 会话的 cwd 解析 scope 并返回该作用域的检索/计分依赖。 */
+  readonly resolve: (agent: Agent | undefined) => Promise<MemoryScopeDeps>
   readonly recentTurns: (agent: Agent | undefined) => readonly string[]
-  /** Usage accounting hook (winners/suppressed counters), fire-and-forget. */
-  readonly onRetrieved: (result: RetrievalResult) => void
   readonly config: Config
 }
 
@@ -178,13 +184,14 @@ export function createMemorySearchTool(deps: MemorySearchDeps) {
         }
         return badLimit
       }
-      const result = await deps.retriever.retrieve(args.query, {
+      const scope = await deps.resolve(exec.agent)
+      const result = await scope.retriever.retrieve(args.query, {
         recentTurns: deps.recentTurns(exec.agent),
         signal: exec.signal,
         topK: args.limit ?? maxResults,
         at,
       })
-      deps.onRetrieved(result)
+      scope.recordRetrieval(result)
       const output: SearchOutput = {
         query: args.query,
         expandedQuery: result.expandedQuery,

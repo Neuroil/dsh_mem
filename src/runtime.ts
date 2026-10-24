@@ -11,11 +11,17 @@
  * assistant/message, turn/end) and batches candidate extraction per turn
  * (§5.1). `agent/*` events are live-only and never persisted, so they are
  * used solely for the pending-query hint, never as a memory source.
+ *
+ * M2 工作区隔离：每个 scope（= session.header.cwd 的归一化哈希；无 cwd 回退
+ * undefined = storage.unit 本名）一个 ScopedRuntime——自己的 store / 检索 /
+ * 写入 / 睡眠 / 计分，惰性开启（ScopeRegistry 缓存 open Promise），卸载时
+ * 统一关闭。写入按会话 scope 路由，注入与工具按 agent 会话 scope 路由；
+ * 单个 scope 开启失败只影响该 scope 的那次事件，不拖垮其他工作区。
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { AssistantMessage, Message, UserMessage } from '@deepseek-ai/dsh-llm'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 // 拉入 system-prompt 包的声明合并，使 'system-prompt/assemble' 事件可类型化
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { createEmbeddingProvider, createRerankerProvider } from './embedding.js'
@@ -26,6 +32,7 @@ import { createVectorIndex } from './vector-store.js'
 import { buildExpandedQuery, MemoryRetriever } from './retrieval.js'
 import { ScoreKeeper } from './scoring.js'
 import { SleepCycle } from './sleep-cycle.js'
+import { ScopeRegistry, scopeKeyOfAgent, scopeKeyOfSession, unitNameFor } from './scope.js'
 import type { Config } from './config.js'
 import type { RetrievalResult } from './types.js'
 import { WritePipeline } from './write-path.js'
@@ -54,8 +61,23 @@ interface SessionState {
   /** This turn's not-yet-processed messages. */
   pending: TurnMessage[]
   watermark: number
+  /** 会话的工作区 scope 键（首事件时由 session.header.cwd 解析，M2）。 */
+  scopeKey?: string
   lastExpandedQuery?: string
   lastResult?: RetrievalResult
+}
+
+/** 一个作用域（工作区或回退）的完整运行时：库 + 四条链路 + 睡眠门控。 */
+interface ScopedRuntime {
+  readonly scopeKey: string | undefined
+  readonly store: MemoryStore
+  readonly retriever: MemoryRetriever
+  readonly write: WritePipeline
+  readonly sleep: SleepCycle
+  readonly scores: ScoreKeeper
+  /** 自上次睡眠周期后新写入的记忆数（§5.3 turn/end 信号门控）。 */
+  newSinceSleep: number
+  sleeping: boolean
 }
 
 export class MemoryRuntime {
@@ -65,15 +87,11 @@ export class MemoryRuntime {
   private readonly sessions = new Map<string, SessionState>()
   /** Pending human input per agent, for the assembly-time retrieval query. */
   private readonly pendingQuery = new Map<string, string>()
-  private store!: MemoryStore
-  private retriever!: MemoryRetriever
-  private write!: WritePipeline
-  private sleep!: SleepCycle
-  private scores!: ScoreKeeper
+  private scopes!: ScopeRegistry<ScopedRuntime>
+  private embedding!: ReturnType<typeof createEmbeddingProvider>
+  private reranker!: ReturnType<typeof createRerankerProvider>
+  private llm!: CordisLlm
   private started = false
-  /** 自上次睡眠周期后新写入的记忆数（§5.3 turn/end 信号门控）。 */
-  private newSinceSleep = 0
-  private sleeping = false
 
   private constructor(ctx: Context, config: Config) {
     this.ctx = ctx
@@ -91,47 +109,27 @@ export class MemoryRuntime {
 
   private async start(): Promise<void> {
     // Persistence goes through ctx.storage — never a private database (§5.0).
+    // 此处只验证后端可用（未注册/缺 kv facet 时启动失败保持响亮）；
+    // unit 的实际 open 延迟到首个作用域命中（ScopeRegistry.open）。
     const backend = this.ctx.storage.backend.get(this.config.storage.backend)
     if (!backend.kv) {
       throw new Error(`storage backend '${this.config.storage.backend}' provides no kv facet; ` +
         `install dsh-storage-json or dsh-storage-sqlite and check the storage.backend config`)
     }
-    const unit = await backend.kv.open(memoryUnitDescriptor(this.config))
+
+    // 三条内部链路共用同一 embedding/reranker/llm（无调用间状态，跨作用域共享）
+    this.embedding = createEmbeddingProvider(this.config.embedding)
+    this.reranker = createRerankerProvider(this.config.reranker, this.embedding)
+    this.llm = new CordisLlm(this.ctx, this.config.llm)
+
+    this.scopes = new ScopeRegistry<ScopedRuntime>({
+      open: async (scopeKey) => this.openScope(scopeKey),
+      close: (rt) => rt.store.close(),
+      onOpenError: (scopeKey, err) =>
+        this.log(`scope open failed (unit ${unitNameFor(scopeKey, this.config)})`, err),
+    })
     this.ctx.effect(() => () => {
-      void unit.close().catch(() => {})
-    })
-
-    this.store = await MemoryStore.open(unit, createVectorIndex(), this.config)
-
-    const embedding = createEmbeddingProvider(this.config.embedding)
-    const reranker = createRerankerProvider(this.config.reranker, embedding)
-    this.retriever = new MemoryRetriever({
-      embedding,
-      reranker,
-      lookup: this.store,
-      config: this.config.retrieval,
-    })
-    // 三条内部链路共用同一 ctx.llm 路由（CordisLlm 无调用间状态）
-    const llm = new CordisLlm(this.ctx, this.config.llm)
-    this.write = new WritePipeline({
-      llm,
-      embedding,
-      store: this.store,
-      config: this.config,
-      log: (msg) => this.log(msg),
-    })
-    this.sleep = new SleepCycle({
-      llm,
-      embedding,
-      store: this.store,
-      config: this.config,
-      log: (msg) => this.log(msg),
-    })
-    this.scores = new ScoreKeeper({
-      llm,
-      store: this.store,
-      config: this.config,
-      log: (msg) => this.log(msg),
+      void this.scopes.closeAll()
     })
 
     this.observeSessions()
@@ -139,22 +137,76 @@ export class MemoryRuntime {
 
     if (this.config.tool.enabled) {
       this.ctx.tools.register(createMemorySearchTool({
-        retriever: this.retriever,
+        resolve: async (agent) => {
+          const rt = await this.scopedFor(scopeKeyOfAgent(agent, this.config))
+          return {
+            retriever: rt.retriever,
+            recordRetrieval: (result: RetrievalResult) => void rt.scores.recordRetrieval(result),
+          }
+        },
         recentTurns: (agent) => this.recentTurnsFor(agent),
-        onRetrieved: (result) => void this.scores.recordRetrieval(result),
         config: this.config,
       }))
     }
 
     this.started = true
-    this.log(`started: ${this.store.validMemories().length} valid memories in store`)
+    this.log(`started: backend=${this.config.storage.backend}, workspaceScope=${this.config.storage.workspaceScope}`)
+  }
+
+  /** 打开一个作用域：unit 名由 scope 键派生，四条链路各持自己的 store 实例。 */
+  private async openScope(scopeKey: string | undefined): Promise<ScopedRuntime> {
+    const unitName = unitNameFor(scopeKey, this.config)
+    const backend = this.ctx.storage.backend.get(this.config.storage.backend)
+    if (!backend.kv) {
+      throw new Error(`storage backend '${this.config.storage.backend}' provides no kv facet`)
+    }
+    const unit = await backend.kv.open(memoryUnitDescriptor(unitName, this.config))
+    const store = await MemoryStore.open(unit, createVectorIndex(), this.config)
+    const rt: ScopedRuntime = {
+      scopeKey,
+      store,
+      retriever: new MemoryRetriever({
+        embedding: this.embedding,
+        reranker: this.reranker,
+        lookup: store,
+        config: this.config.retrieval,
+      }),
+      write: new WritePipeline({
+        llm: this.llm,
+        embedding: this.embedding,
+        store,
+        config: this.config,
+        log: (msg) => this.log(msg),
+      }),
+      sleep: new SleepCycle({
+        llm: this.llm,
+        embedding: this.embedding,
+        store,
+        config: this.config,
+        log: (msg) => this.log(msg),
+      }),
+      scores: new ScoreKeeper({
+        llm: this.llm,
+        store,
+        config: this.config,
+        log: (msg) => this.log(msg),
+      }),
+      newSinceSleep: 0,
+      sleeping: false,
+    }
+    this.log(`scope opened: unit=${unitName} (${store.validMemories().length} valid memories)`)
+    return rt
+  }
+
+  private scopedFor(scopeKey: string | undefined): Promise<ScopedRuntime> {
+    return this.scopes.get(scopeKey)
   }
 
   // ---- write path: session/event observation (§5.1) ----
 
   private observeSessions(): void {
-    this.ctx.on('session/event', (session, event: SessionEvent) => {
-      const state = this.stateFor(session.id)
+    this.ctx.on('session/event', (session: Session, event: SessionEvent) => {
+      const state = this.stateFor(session)
       switch (event.type) {
         case 'user/message': {
           const message = event.data as UserMessage
@@ -174,17 +226,23 @@ export class MemoryRuntime {
           if (batch.length === 0) break
           const turn = (event.data as { turn: number }).turn
           const sessionId = session.id
+          const scopeKey = state.scopeKey
           // Fire-and-forget: memory consolidation never blocks the turn loop.
-          void this.write.processTurn(sessionId, turn, batch)
-            .then((outcome) => {
+          // scope 开启失败（或写入失败）只影响本工作区本轮，日志旁路。
+          void (async () => {
+            try {
+              const rt = await this.scopedFor(scopeKey)
+              const outcome = await rt.write.processTurn(sessionId, turn, batch)
               if (outcome.written.length > 0 || outcome.superseded.length > 0) {
                 this.log(`turn ${turn}: wrote ${outcome.written.length}, superseded ${outcome.superseded.length}, dropped ${outcome.dropped}`)
               }
-              // 睡眠周期触发计数（§5.3：turn/end 信号 + 新记忆量门控）
-              this.newSinceSleep += outcome.written.length
-              this.maybeSleep()
-            })
-            .catch((err) => this.log('write pipeline failed', err))
+              // 睡眠周期触发计数（§5.3：turn/end 信号 + 新记忆量门控，按作用域）
+              rt.newSinceSleep += outcome.written.length
+              this.maybeSleep(rt)
+            } catch (err) {
+              this.log('write pipeline failed', err)
+            }
+          })()
           break
         }
       }
@@ -201,11 +259,18 @@ export class MemoryRuntime {
     state.watermark = event.seq
   }
 
-  private stateFor(sessionId: string): SessionState {
-    let state = this.sessions.get(sessionId)
+  private stateFor(session: Session): SessionState {
+    const id = String(session.id)
+    let state = this.sessions.get(id)
     if (!state) {
-      state = { recent: [], pending: [], watermark: 0 }
-      this.sessions.set(sessionId, state)
+      state = {
+        recent: [],
+        pending: [],
+        watermark: 0,
+        // scope 键在会话首事件时解析一次（cwd 是创建期元数据，会话期间不变）
+        scopeKey: scopeKeyOfSession(session, this.config),
+      }
+      this.sessions.set(id, state)
     }
     return state
   }
@@ -232,7 +297,7 @@ export class MemoryRuntime {
       agent.ctx.on('system-prompt/assemble', async (assembly, context, next) => {
         const downstream = await next()
         try {
-          const text = await this.renderAutoSection(String(agent.id), context.signal)
+          const text = await this.renderAutoSection(agent, context.signal)
           if (text) downstream.sections.push({ name: 'dsh-mem', text })
         } catch (err) {
           this.log('auto section retrieval failed; leaving prompt unchanged', err)
@@ -248,45 +313,55 @@ export class MemoryRuntime {
     return state ? state.recent.slice(-this.config.retrieval.contextTurns).map((m) => m.text) : []
   }
 
-  private async renderAutoSection(agentId: string, signal?: AbortSignal): Promise<string> {
+  private async renderAutoSection(agent: Agent, signal?: AbortSignal): Promise<string> {
+    const agentId = String(agent.id)
     const state = this.sessions.get(agentId)
     const query = this.pendingQuery.get(agentId)
       ?? (state ? [...state.recent].reverse().find((m) => m.role === 'user')?.text : undefined)
-    if (!query || !state) return ''
+    if (!query) return ''
 
-    const recentTurns = state.recent.slice(-this.config.retrieval.contextTurns).map((m) => m.text)
+    // scope 取自 agent 的会话（首个装配可能先于任何 session/event，此时
+    // sessions 里还没有 state——scopeKeyOfAgent 直接读 session.header.cwd）
+    const rt = await this.scopedFor(scopeKeyOfAgent(agent, this.config))
+    const recentTurns = (state ? state.recent : []).slice(-this.config.retrieval.contextTurns).map((m) => m.text)
     const expanded = buildExpandedQuery(query, recentTurns, this.config.retrieval.contextTurns)
     // Skip re-running the chain when the expanded query is unchanged within a
     // turn (steps after tool calls re-assemble the prompt).
-    if (state.lastExpandedQuery !== expanded || !state.lastResult) {
-      state.lastResult = await this.retriever.retrieve(query, {
+    if (!state || state.lastExpandedQuery !== expanded || !state.lastResult) {
+      const result = await rt.retriever.retrieve(query, {
         recentTurns,
         signal,
         topK: this.config.section.maxMemories,
       })
-      state.lastExpandedQuery = expanded
-      void this.scores.recordRetrieval(state.lastResult)
+      void rt.scores.recordRetrieval(result)
+      if (state) {
+        state.lastResult = result
+        state.lastExpandedQuery = expanded
+      }
+      return formatMemories(result, this.config.section.maxMemories, this.config.section.header)
     }
+    void rt.scores.recordRetrieval(state.lastResult)
     return formatMemories(state.lastResult, this.config.section.maxMemories, this.config.section.header)
   }
 
   // ---- offline consolidation cycle ("sleep", §2.3/§5.3) ----
 
   /**
-   * 睡眠周期触发门控（§5.3）：自上次周期后新写入 ≥ sleep.minNewMemories 时
-   * fire-and-forget 执行一轮；周期内不重入（新写入计数保留，周期结束后立即
-   * 补判）。聚类池不足 clusterMinSize 时不触发也不清零——等记忆继续累积。
+   * 睡眠周期触发门控（§5.3，按作用域）：自上次周期后新写入 ≥
+   * sleep.minNewMemories 时 fire-and-forget 执行一轮；周期内不重入（新写入
+   * 计数保留，周期结束后立即补判）。聚类池不足 clusterMinSize 时不触发也
+   * 不清零——等记忆继续累积。
    */
-  private maybeSleep(): void {
-    if (!this.started || !this.config.sleep.enabled || this.sleeping) return
-    if (this.newSinceSleep < this.config.sleep.minNewMemories) return
-    const pool = this.store
+  private maybeSleep(rt: ScopedRuntime): void {
+    if (!this.started || !this.config.sleep.enabled || rt.sleeping) return
+    if (rt.newSinceSleep < this.config.sleep.minNewMemories) return
+    const pool = rt.store
       .validMemories()
       .filter((record) => record.flags.compressed_into === undefined)
     if (pool.length < this.config.sleep.clusterMinSize) return
-    this.newSinceSleep = 0
-    this.sleeping = true
-    void this.sleep.run()
+    rt.newSinceSleep = 0
+    rt.sleeping = true
+    void rt.sleep.run()
       .then((outcome) => {
         const migrated = outcome.clusters.filter((c) => c.route === 'new_node' || c.route === 'attached').length
         const gated = outcome.clusters.filter((c) => c.route === 'qa_failed' || c.route === 'epi_failed').length
@@ -298,9 +373,9 @@ export class MemoryRuntime {
       })
       .catch((err) => this.log('sleep cycle failed', err))
       .finally(() => {
-        this.sleeping = false
+        rt.sleeping = false
         // 周期运行期间积累的新写入立即补判一次
-        this.maybeSleep()
+        this.maybeSleep(rt)
       })
   }
 }

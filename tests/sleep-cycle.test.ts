@@ -30,7 +30,7 @@ import type { EmbeddingProvider, InternalLlm, MemoryRecord, SemanticNode } from 
 // ---- 测试基建 ----
 
 const BASE_CONFIG: Config = {
-  storage: { backend: 'json', unit: 'dsh_mem', version: 1 },
+  storage: { backend: 'json', unit: 'dsh_mem', version: 1, workspaceScope: false },
   embedding: { mode: 'deterministic', endpoint: '', model: '', apiKey: '', timeoutMs: 5_000, dimensions: 8, batchSize: 8 },
   reranker: { mode: 'deterministic', endpoint: '', model: '', apiKey: '', timeoutMs: 5_000 },
   llm: { provider: 'deepseek', model: 'deepseek-chat', temperature: 0, maxTokens: 2048 },

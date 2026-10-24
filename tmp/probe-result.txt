@@ -1,0 +1,2 @@
+probe loaded at 2026-10-24T14:06:01.819Z
+OK: registered, opened, wrote, read back: {"hello":"sqlite","arr":[1,2,3],"nested":{"ok":true}}

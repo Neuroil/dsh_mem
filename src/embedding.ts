@@ -4,6 +4,7 @@
  * Cohere/Jina 式 /rerank 协议；deterministic 模式是离线测试替身。
  */
 import type { EmbeddingConfig, HttpModelConfig } from './config.js'
+import { fnv1a } from './scope.js'
 import type { EmbeddingProvider, RerankerProvider } from './types.js'
 
 /** 本地归一化（服务端向量不保证单位长度，统一在此归一）。 */
@@ -40,16 +41,6 @@ async function postJson(
     throw new Error(`${endpoint} responded ${response.status}: ${text.slice(0, 300)}`)
   }
   return response.json()
-}
-
-/** FNV-1a 32 位哈希。 */
-function fnv1a(text: string): number {
-  let hash = 0x811c9dc5
-  for (let i = 0; i < text.length; i++) {
-    hash ^= text.charCodeAt(i)
-    hash = Math.imul(hash, 0x01000193) >>> 0
-  }
-  return hash >>> 0
 }
 
 /**

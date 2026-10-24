@@ -120,10 +120,16 @@ export interface ToolConfig {
 export interface StorageConfig {
   /** Backend name registered on ctx.storage (`json` / `sqlite`). */
   backend: string
-  /** KV unit name; must satisfy UNIT_NAME_RE — no hyphens (host rule, safe as file/SQL name). */
+  /**
+   * Unit 名前缀 + 无 cwd 会话的回退 unit（M2）：工作区 unit 名由插件派生为
+   * `<unit>_ws_<scopeHash>`；必须满足 UNIT_NAME_RE——不允许连字符（宿主规则，
+   * 安全作文件/SQL 名）。
+   */
   unit: string
   /** Unit format version, bumped on incompatible record-shape changes. */
   version: number
+  /** true = 按会话工作目录（session.header.cwd）一区一库；false = 全局单库（旧行为）。 */
+  workspaceScope: boolean
 }
 
 export interface Config {
@@ -161,7 +167,8 @@ export const Config: Schema<Config> = Schema.object({
     backend: Schema.string().default('json'),
     unit: Schema.string().pattern(UNIT_NAME_RE).default('dsh_mem'),
     version: Schema.natural().default(1),
-  }).default({ backend: 'json', unit: 'dsh_mem', version: 1 }),
+    workspaceScope: Schema.boolean().default(true),
+  }).default({ backend: 'json', unit: 'dsh_mem', version: 1, workspaceScope: true }),
 
   // Embeddings and reranking are plugin-owned dependencies: dsh ships no
   // seam for them, so endpoints/models/dims are configured here (§3.1).

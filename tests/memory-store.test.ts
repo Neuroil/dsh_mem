@@ -12,7 +12,7 @@ import type { KvUnit, KvUnitDescriptor } from '@deepseek-ai/dsh-storage'
 
 /** 完整 Config 字面量（阈值等与断言耦合的字段显式写出）。 */
 const testConfig = (): Config => ({
-  storage: { backend: 'json', unit: 'dsh_mem_test', version: 7 },
+  storage: { backend: 'json', unit: 'dsh_mem_test', version: 7, workspaceScope: false },
   embedding: { mode: 'deterministic', endpoint: '', model: '', apiKey: '', timeoutMs: 1000, dimensions: 2, batchSize: 1 },
   reranker: { mode: 'deterministic', endpoint: '', model: '', apiKey: '', timeoutMs: 1000 },
   llm: { provider: 'deepseek', model: 'deepseek-chat', temperature: 0, maxTokens: 512 },
@@ -142,7 +142,7 @@ class FakeVectorIndex implements VectorIndex {
 /** 开一套 store 环境：backing 跨 open 共享；index 由测试持有以便检查一致性。 */
 async function makeEnv() {
   const config = testConfig()
-  const backing = new FakeBacking(memoryUnitDescriptor(config))
+  const backing = new FakeBacking(memoryUnitDescriptor(config.storage.unit, config))
   const open = async () => {
     const index = new FakeVectorIndex()
     const store = await MemoryStore.open(new FakeKvUnit(backing), index, config)
@@ -157,9 +157,9 @@ const open = async () => (await makeEnv()).open()
 // ---------------------------------------------------------------- 用例
 
 describe('memoryUnitDescriptor', () => {
-  it('形状：表名 episodic+semantic，name/version 来自 config，无 global 槽', () => {
+  it('形状：表名 episodic+semantic，name 来自入参、version 来自 config，无 global 槽', () => {
     const config = testConfig()
-    expect(memoryUnitDescriptor(config)).toEqual({
+    expect(memoryUnitDescriptor(config.storage.unit, config)).toEqual({
       name: 'dsh_mem_test',
       version: 7,
       tables: ['episodic', 'semantic'],
@@ -167,24 +167,22 @@ describe('memoryUnitDescriptor', () => {
     })
   })
 
-  it('跟随 config.storage 变化', () => {
+  it('unit 名由入参决定（M2：工作区 unit 名由 scope.ts 派生后传入）', () => {
     const config = testConfig()
-    config.storage = { backend: 'sqlite', unit: 'other_unit', version: 3 }
-    const d = memoryUnitDescriptor(config)
-    expect(d.name).toBe('other_unit')
+    config.storage = { backend: 'sqlite', unit: 'other_unit', version: 3, workspaceScope: true }
+    const d = memoryUnitDescriptor('dsh_mem_ws_ab12cd34', config)
+    expect(d.name).toBe('dsh_mem_ws_ab12cd34')
     expect(d.version).toBe(3)
   })
 
   it('unit 名连字符归一为下划线（宿主不允许连字符）', () => {
     const config = testConfig()
-    config.storage = { backend: 'json', unit: 'dsh-mem-test', version: 7 }
-    expect(memoryUnitDescriptor(config).name).toBe('dsh_mem_test')
+    expect(memoryUnitDescriptor('dsh-mem-test', config).name).toBe('dsh_mem_test')
   })
 
   it('归一化后仍不合规的 unit 名在启动期抛错', () => {
     const config = testConfig()
-    config.storage = { backend: 'json', unit: '1bad Unit', version: 7 }
-    expect(() => memoryUnitDescriptor(config)).toThrow(/invalid storage unit name/)
+    expect(() => memoryUnitDescriptor('1bad Unit', config)).toThrow(/invalid storage unit name/)
   })
 })
 
