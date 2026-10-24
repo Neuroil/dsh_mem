@@ -1,0 +1,18 @@
+{
+  "name": "dsh-mem-benchmark",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Performance & space-utilization benchmarks for the dsh-mem plugin (runs against ../lib, the built plugin output)",
+  "scripts": {
+    "insert": "node bench-insert.mjs",
+    "retrieval": "node bench-retrieval.mjs",
+    "write": "node bench-write.mjs",
+    "sleep": "node bench-sleep.mjs",
+    "space": "node bench-space.mjs",
+    "all": "node run-all.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-storage-sqlite": "0.2.1-rc.2"
+  }
+}
