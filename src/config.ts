@@ -115,6 +115,12 @@ export interface SectionConfig {
 export interface ToolConfig {
   enabled: boolean
   maxResults: number
+  /**
+   * `memory_clear` 工具开关（默认 false）：按作用域硬删除全部长期记忆的
+   * 开发/测试工具——唯一违反「记录永不删除」（§2.5）的操作，时间旅行也
+   * 不可回溯，仅建议测试环境开启。
+   */
+  clear: boolean
 }
 
 /** 会话历史入口（M3）：对话历史的来源与"什么算人类输入"由配置决定。 */
@@ -313,7 +319,8 @@ export const Config: Schema<Config> = Schema.object({
   tool: Schema.object({
     enabled: Schema.boolean().default(true),
     maxResults: Schema.natural().min(1).default(5),
-  }).default({ enabled: true, maxResults: 5 }),
+    clear: Schema.boolean().default(false),
+  }).default({ enabled: true, maxResults: 5, clear: false }),
 
   // 会话历史入口（M3）：见 IntakeConfig 注释
   intake: Schema.object({

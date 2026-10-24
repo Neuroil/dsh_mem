@@ -4,6 +4,7 @@
  * Cohere/Jina 式 /rerank 协议；deterministic 模式是离线测试替身。
  */
 import type { EmbeddingConfig, HttpModelConfig } from './config.js'
+import { sigmoid } from './metrics.js'
 import { fnv1a } from './scope.js'
 import type { EmbeddingProvider, RerankerProvider } from './types.js'
 
@@ -144,14 +145,22 @@ export function createRerankerProvider(
       ) as RerankResponse
       const rows = payload.results
       if (!Array.isArray(rows)) throw new Error(`${config.endpoint} 返回缺失 results 字段`)
-      const scores = new Array<number>(documents.length).fill(0)
+      const collected: Array<[number, number]> = []
       rows.forEach((row, fallback) => {
         const score = row.relevance_score
         if (typeof score !== 'number' || !Number.isFinite(score)) return
         const index = row.index ?? fallback
         if (index < 0 || index >= documents.length) return
-        scores[index] = Math.min(1, Math.max(0, score))
+        collected.push([index, score])
       })
+      // 量纲按整组一致判定：任一分数越出 [0,1] 即整组为原始 logit（llama.cpp
+      // /rerank 直接返回模型输出、无 sigmoid），先 σ 归一；整组已在 [0,1]（云端
+      // 服务）视为已归一。两种量纲最终都夹取到 [0,1]。
+      const isLogit = collected.some(([, score]) => score < 0 || score > 1)
+      const scores = new Array<number>(documents.length).fill(0)
+      for (const [index, score] of collected) {
+        scores[index] = Math.min(1, Math.max(0, isLogit ? sigmoid(score) : score))
+      }
       return scores
     },
   }

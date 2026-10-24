@@ -87,8 +87,7 @@ export function formatMemories(result: RetrievalResult, max: number, header: str
   return `${header}\n${lines.join('\n')}`
 }
 
-export function createMemorySearchTool(deps: MemorySearchDeps) {
-  const maxResults = deps.config.tool.maxResults
+export function createMemorySearchTool(deps: MemorySearchDeps) {  const maxResults = deps.config.tool.maxResults
   return defineTool({
     name: 'memory_search',
     description:
@@ -198,6 +197,98 @@ export function createMemorySearchTool(deps: MemorySearchDeps) {
         memories: result.top.map(toHit),
         suppressedCount: result.suppressed.length,
         ...(at !== undefined ? { at } : {}),
+      }
+      return output
+    },
+  })
+}
+
+interface ClearOutput {
+  episodic: number
+  semantic: number
+  total: number
+  /** 领域性拒绝（confirm 闸）写入规范值而非抛异常（工具契约）。 */
+  error?: string
+}
+
+export interface MemoryClearDeps {
+  /** 由 agent 会话的 cwd 解析 scope 并返回该作用域的清空操作（runtime 复位睡眠计数）。 */
+  readonly resolve: (agent: Agent | undefined) => Promise<{
+    clear: () => Promise<{ episodic: number; semantic: number }>
+  }>
+}
+
+/**
+ * The `memory_clear` tool — a destructive dev/test utility: hard-deletes every
+ * long-term memory in the calling session's workspace store, the ONLY operation
+ * in the system that violates the "records are never deleted" invariant (§2.5).
+ * Gated behind `config.tool.clear` (default false) and an explicit `confirm`
+ * argument; superseded/archived memories are gone too and time travel cannot
+ * bring them back.
+ */
+export function createMemoryClearTool(deps: MemoryClearDeps) {
+  return defineTool({
+    name: 'memory_clear',
+    description:
+      'Permanently delete ALL long-term memories in this workspace\'s memory store: ' +
+      'episodic memories and distilled semantic gists alike, including superseded and ' +
+      'archived ones. Destructive and irreversible — time-travel search will NOT bring ' +
+      'them back. Only call this when the user explicitly asks to wipe or reset ' +
+      'long-term memory (e.g. for test iteration), and always pass confirm=true.',
+    parameters: {
+      confirm: {
+        type: 'boolean',
+        required: true,
+        description: 'Must be exactly true to acknowledge the destructive wipe.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          episodic: { type: 'integer', required: true },
+          semantic: { type: 'integer', required: true },
+          total: { type: 'integer', required: true },
+          error: { type: 'string' },
+        },
+      },
+      render: (_args, value: ClearOutput) => [
+        {
+          type: 'text',
+          text: value.error !== undefined
+            ? `memory_clear refused: ${value.error}`
+            : `Cleared ${value.total} long-term memories (${value.episodic} episodic, ${value.semantic} semantic nodes).`,
+        },
+      ],
+    },
+    presentCall: () => ({
+      card: 'generic',
+      title: 'memory_clear: wipe all long-term memories (irreversible)',
+      kind: 'delete',
+    }),
+    presentResult: () => ({
+      card: 'generic',
+      title: 'memory_clear',
+    }),
+    async execute(args, exec) {
+      // 领域级 confirm 闸：宿主参数校验只保证 confirm 是 boolean，false 在此
+      // 拒绝（规范 error 值，不抛异常，不触碰存储）。
+      if (args.confirm !== true) {
+        const refused: ClearOutput = {
+          episodic: 0,
+          semantic: 0,
+          total: 0,
+          error: 'confirm must be exactly true (destructive, irreversible wipe of all long-term memories)',
+        }
+        return refused
+      }
+      const scope = await deps.resolve(exec.agent)
+      const counts = await scope.clear()
+      const output: ClearOutput = {
+        episodic: counts.episodic,
+        semantic: counts.semantic,
+        total: counts.episodic + counts.semantic,
       }
       return output
     },

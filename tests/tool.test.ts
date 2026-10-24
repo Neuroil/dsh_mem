@@ -5,7 +5,7 @@
  */
 import { describe, expect, it, vi } from 'vitest'
 import type { ToolExecution } from '@deepseek-ai/dsh-tools'
-import { createMemorySearchTool, formatMemories, parseAt } from '../src/tool.js'
+import { createMemoryClearTool, createMemorySearchTool, formatMemories, parseAt } from '../src/tool.js'
 import type { MemoryRetriever } from '../src/retrieval.js'
 import type { Config } from '../src/config.js'
 import type { RetrievalResult } from '../src/types.js'
@@ -21,7 +21,7 @@ const config: Config = {
   score: { useGain: 0.5, suppressPenalty: 0.05, decayTauDays: 180, rejudgeEma: 0.5 },
   sleep: { enabled: true, minNewMemories: 10, clusterCos: 0.75, clusterMinSize: 3, qaPairCount: 3, qaF1Threshold: 0.8, epiThreshold: 0.5, conWindow: 1000, conAttachSigma: 0.5, conNewNodeSigma: -1, conNewNodeMinImp: 7, attachGain: 0.5 },
   section: { enabled: true, maxMemories: 5, header: 'memories:' },
-  tool: { enabled: true, maxResults: 5 },
+  tool: { enabled: true, maxResults: 5, clear: false },
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
 }
 
@@ -139,5 +139,56 @@ describe('render / formatMemories（规范值纯投影）', () => {
 describe('formatMemories（section 渲染）', () => {
   it('空结果返回空串（不注入 section）', () => {
     expect(formatMemories(emptyResult(), 5, 'memories:')).toBe('')
+  })
+})
+
+describe('memory_clear.execute（开发/测试工具：硬删除全库）', () => {
+  const execClear = { callId: 'c2', name: 'memory_clear', arguments: {} } as unknown as ToolExecution
+
+  function makeClearDeps(clear: ReturnType<typeof vi.fn>) {
+    return { resolve: async () => ({ clear }) }
+  }
+
+  it('confirm=true：调用 clear 并返回规范计数（total = episodic + semantic）', async () => {
+    const clear = vi.fn(async () => ({ episodic: 3, semantic: 2 }))
+    const tool = createMemoryClearTool(makeClearDeps(clear))
+
+    const output = await tool.execute({ confirm: true }, execClear) as Record<string, unknown>
+
+    expect(clear).toHaveBeenCalledTimes(1)
+    expect(output).toEqual({ episodic: 3, semantic: 2, total: 5 })
+    expect(output).not.toHaveProperty('error')
+  })
+
+  it('confirm=false：拒绝执行、规范 error 值（不抛异常、不触碰存储）', async () => {
+    const clear = vi.fn(async () => ({ episodic: 0, semantic: 0 }))
+    const tool = createMemoryClearTool(makeClearDeps(clear))
+
+    const output = await tool.execute({ confirm: false }, execClear) as Record<string, unknown>
+
+    expect(clear).not.toHaveBeenCalled()
+    expect(output['total']).toBe(0)
+    expect(String(output['error'])).toContain('confirm')
+  })
+
+  it('confirm 缺失：宿主参数校验在 execute 之前拒绝（ToolArgsError）', async () => {
+    const clear = vi.fn(async () => ({ episodic: 0, semantic: 0 }))
+    const tool = createMemoryClearTool(makeClearDeps(clear))
+
+    await expect(tool.execute({} as never, execClear)).rejects.toThrow(/confirm/)
+    expect(clear).not.toHaveBeenCalled()
+  })
+
+  it('render：拒绝值渲染 refused 文本；成功值渲染清空计数', async () => {
+    const clear = vi.fn(async () => ({ episodic: 3, semantic: 2 }))
+    const tool = createMemoryClearTool(makeClearDeps(clear))
+
+    const ok = await tool.execute({ confirm: true }, execClear) as never
+    const okBlocks = tool.output.render({ confirm: true }, ok)
+    expect(String((okBlocks[0] as { text: string }).text)).toContain('Cleared 5')
+
+    const refused = await tool.execute({ confirm: false }, execClear) as never
+    const refusedBlocks = tool.output.render({ confirm: false }, refused)
+    expect(String((refusedBlocks[0] as { text: string }).text)).toContain('memory_clear refused')
   })
 })

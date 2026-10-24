@@ -22,7 +22,7 @@ const testConfig = (): Config => ({
   score: { useGain: 0.5, suppressPenalty: 0.05, decayTauDays: 180, rejudgeEma: 0.5 },
   sleep: { enabled: true, minNewMemories: 10, clusterCos: 0.75, clusterMinSize: 3, qaPairCount: 3, qaF1Threshold: 0.8, epiThreshold: 0.5, conWindow: 1000, conAttachSigma: 0.5, conNewNodeSigma: -1, conNewNodeMinImp: 7, attachGain: 0.5 },
   section: { enabled: true, maxMemories: 5, header: 'memories:' },
-  tool: { enabled: true, maxResults: 5 },
+  tool: { enabled: true, maxResults: 5, clear: false },
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
 })
 
@@ -573,6 +573,57 @@ describe('MemoryStore 生命周期', () => {
     await expect(store.putNode(makeNode('n', [1, 0]))).rejects.toThrow('closed')
     await expect(store.refreshNeighborhood('a', 5)).rejects.toThrow('closed')
     await expect(store.refreshNodeNeighborhood('n', 5)).rejects.toThrow('closed')
+  })
+})
+
+describe('MemoryStore clearAll（memory_clear 后端：唯一硬删除路径）', () => {
+  it('双表全清（含软失效与已压缩记录）：计数正确、镜像与索引同步清空', async () => {
+    const { index, store } = await open()
+    await store.putRecord(makeRecord({ id: 'a', embedding: [1, 0] }))
+    await store.putRecord(makeRecord({ id: 'dead', embedding: [0, 1], time_meta: { created_at: 1, valid_at: 1, invalid_at: 9 } }))
+    await store.putRecord(makeRecord({ id: 'arch', embedding: [1, 1], flags: { compressed_into: 'n1' } }))
+    await store.putNode(makeNode('n1', [0.6, 0.8]))
+    await store.putNode(makeNode('n2', [0, 1], { time_meta: { created_at: 1, valid_at: 1, invalid_at: 9 } }))
+    // 索引恒含有效记录（含已压缩）与有效节点：a + arch + n1
+    expect(index.size()).toBe(3)
+    const counts = await store.clearAll()
+    expect(counts).toEqual({ episodic: 3, semantic: 2 })
+    expect(store.allMemories()).toHaveLength(0)
+    expect(store.allNodes()).toHaveLength(0)
+    expect(store.validMemories()).toHaveLength(0)
+    expect(store.retrievable()).toHaveLength(0)
+    expect(store.retrievableAt(500)).toHaveLength(0)
+    expect(index.size()).toBe(0)
+    expect(store.similar([1, 0], 10)).toHaveLength(0)
+    await store.close()
+  })
+
+  it('清空是持久化的：重开（同一介质）后两表为空', async () => {
+    const { open } = await makeEnv()
+    {
+      const { store } = await open()
+      await store.putRecord(makeRecord({ id: 'a', embedding: [1, 0] }))
+      await store.putNode(makeNode('n1', [0, 1]))
+      await store.clearAll()
+      await store.close()
+    }
+    const { store: store2 } = await open()
+    expect(store2.allMemories()).toHaveLength(0)
+    expect(store2.allNodes()).toHaveLength(0)
+    expect(store2.retrievable()).toHaveLength(0)
+    await store2.close()
+  })
+
+  it('空库清空是干净的无操作（0/0）', async () => {
+    const { store } = await open()
+    await expect(store.clearAll()).resolves.toEqual({ episodic: 0, semantic: 0 })
+    await store.close()
+  })
+
+  it('close 后抛 Error(\'closed\')', async () => {
+    const { store } = await open()
+    await store.close()
+    await expect(store.clearAll()).rejects.toThrow('closed')
   })
 })
 

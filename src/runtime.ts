@@ -37,7 +37,7 @@ import { ScopeRegistry, scopeKeyOfAgent, scopeKeyOfSession, unitNameFor } from '
 import type { Config } from './config.js'
 import type { RetrievalResult } from './types.js'
 import { WritePipeline } from './write-path.js'
-import { createMemorySearchTool, formatMemories } from './tool.js'
+import { createMemoryClearTool, createMemorySearchTool, formatMemories } from './tool.js'
 
 /** Extract visible text from a message's content blocks. */
 export function messageText(message: Message): string {
@@ -124,9 +124,10 @@ export class MemoryRuntime {
       onOpenError: (scopeKey, err) =>
         this.log(`scope open failed (unit ${unitNameFor(scopeKey, this.config)})`, err),
     })
-    this.ctx.effect(() => () => {
-      void this.scopes.closeAll()
-    })
+    // 清理函数必须**返回** closeAll 的 Promise：Cordis 卸载会 await disposer，
+    // 这样旧实例的 unit 全部关闭后才加载新实例。原先 `void closeAll()` 让卸载
+    // 提前返回，HMR 重载时新实例抢开同一 unit 会撞上后端 "already open"。
+    this.ctx.effect(() => () => this.scopes.closeAll())
 
     this.observeSessions()
     this.observeAgents()
@@ -145,8 +146,27 @@ export class MemoryRuntime {
       }))
     }
 
+    // 开发/测试工具（默认关闭）：按作用域硬删除全部长期记忆——全系统唯一
+    // 违反「记录永不删除」（§2.5）的操作，须 config.tool.clear 显式开启。
+    if (this.config.tool.clear) {
+      this.ctx.tools.register(createMemoryClearTool({
+        resolve: async (agent) => {
+          const rt = await this.scopedFor(scopeKeyOfAgent(agent, this.config))
+          return {
+            clear: async () => {
+              const counts = await rt.store.clearAll()
+              // 睡眠触发计数一并复位：清空后旧计数没有意义，避免下一轮
+              // turn/end 用残留计数立即触发一次空池睡眠周期。
+              rt.newSinceSleep = 0
+              return counts
+            },
+          }
+        },
+      }))
+    }
+
     this.started = true
-    this.log(`started: backend=${this.config.storage.backend}, workspaceScope=${this.config.storage.workspaceScope}`)
+    this.log(`started: backend=${this.config.storage.backend}, workspaceScope=${this.config.storage.workspaceScope}, clearTool=${this.config.tool.clear}`)
   }
 
   /** 打开一个作用域：unit 名由 scope 键派生，四条链路各持自己的 store 实例。 */
@@ -157,7 +177,15 @@ export class MemoryRuntime {
       throw new Error(`storage backend '${this.config.storage.backend}' provides no kv facet`)
     }
     const unit = await backend.kv.open(memoryUnitDescriptor(unitName, this.config))
-    const store = await MemoryStore.open(unit, createVectorIndex(), this.config)
+    let store: MemoryStore
+    try {
+      store = await MemoryStore.open(unit, createVectorIndex(), this.config)
+    } catch (err) {
+      // 开库已占用后端 unit 槽：快照加载失败必须就地关闭，否则 ScopeRegistry
+      // 删掉失败的缓存项后每次重试都撞 "already open"，该工作区永久不可用。
+      await unit.close().catch(() => {})
+      throw err
+    }
     const rt: ScopedRuntime = {
       scopeKey,
       store,

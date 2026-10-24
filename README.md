@@ -17,11 +17,11 @@
 | 2 | dsh 宿主 | `npx @deepseek-ai/dsh web` 可启动并进入聊天 UI | npm（DeepSeek 官方包） | 无运行环境 |
 | 3 | 存储后端 | 二选一：json（dsh-base 自带，零安装）；或 **sqlite（推荐）** `@deepseek-ai/dsh-storage-sqlite`，版本与宿主**逐位一致**（宿主 0.2.1-rc.2 就装 0.2.1-rc.2；装 0.2.1-rc.3 会被 peer 闸拒） | `dsh plugin --profile web add @deepseek-ai/dsh-storage-sqlite@<宿主版本>`（宿主版本用 `dsh --version` 查） | 插件启动报 `provides no kv facet`，完全不加载 |
 | 4 | LLM 适配器 + 凭据 | 一个已在 ctx.llm **注册的 provider 名**与有凭据的模型：`dsh-llm-deepseek` 注册名为 `deepseek-official`，模型 `deepseek-v4-flash` / `deepseek-v4-pro`（本插件 schema 默认的 `deepseek` / `deepseek-chat` **不在注册表**，必须覆盖） | 适配器随 dsh base bundle；凭据入宿主凭据文件 `~/.dsh/.credentials.yaml`（refs 指向 `DEEPSEEK_API_KEY`） | 判分/矛盾判定/抽取全部失败（NO_ADAPTER），写入管线空转 |
-| 5 | 嵌入 API key | SiliconFlow key（默认模型 `BAAI/bge-m3`，1024 维） | siliconflow.cn 控制台申请 | 只能以 `deterministic` 冒烟（验证管线、无语义） |
-| 6 | 重排 API key | SiliconFlow key（默认模型 `BAAI/bge-reranker-v2-m3`；可与 #5 共用同一把） | 同 #5 | 检索链路在精排步失败（见[排障](#排障)） |
+| 5 | 嵌入端点 | **推荐本地 llama.cpp**（零 key、离线、免费；部署步骤见下文「[推荐：本地部署 llama.cpp](#推荐本地部署-llamacpp-替代云端-api嵌入--重排)」一节）——插件默认模型 `BAAI/bge-m3`（1024 维，多语言）有现成 GGUF。云端替代：SiliconFlow key（siliconflow.cn 控制台申请） | 下节 / siliconflow.cn | 只能以 `deterministic` 冒烟（验证管线、无语义） |
+| 6 | 重排端点 | 同 #5：本地 llama.cpp 开第二个 server 进程；云端替代：SiliconFlow key（默认模型 `BAAI/bge-reranker-v2-m3`；云端方案可与 #5 共用同一把） | 同 #5 | 检索链路在精排步失败（见[排障](#排障)） |
 | 7 | 本插件本体 | 方式 A：本仓库构建出的 `lib/`；方式 B：本包目录经 `dsh plugin add` | 下两节 | — |
 
-嵌入/重排的 `endpoint` / `model` / `dimensions` **出厂默认已对准 SiliconFlow**（`https://api.siliconflow.cn/v1/embeddings` + `BAAI/bge-m3`(1024)；`https://api.siliconflow.cn/v1/rerank` + `BAAI/bge-reranker-v2-m3`），因此真实语义只需补两把 key；换任何 OpenAI 兼容 `/embeddings` 或 `/rerank` 服务时改 `endpoint` / `model` / `apiKey` 三个键、并把 `dimensions` 对齐实际模型即可。
+嵌入/重排的 `endpoint` / `model` / `dimensions` **出厂默认已对准 SiliconFlow**（`https://api.siliconflow.cn/v1/embeddings` + `BAAI/bge-m3`(1024)；`https://api.siliconflow.cn/v1/rerank` + `BAAI/bge-reranker-v2-m3`），云端方案真实语义只需补两把 key；换任何 OpenAI 兼容 `/embeddings` 或 `/rerank` 服务——**含本地 llama.cpp（推荐，见下节）**——时改 `endpoint` / `model` / `apiKey` 三个键、并把 `dimensions` 对齐实际模型即可。
 
 ### 方式 A：本地源码加载（开发）
 
@@ -68,6 +68,95 @@ dsh plugin --profile web add /Path/To/dsh_mem
 
 **记忆隔离与入口（M2/M3）默认即所需行为**：`storage.workspaceScope: true` = 每工作区一库（QQ bot 等以适配器接入的会话自动归属其运行目录的工作区）；`intake.session.acceptSourceKinds: ['user']` = 只有用户消息算人类输入——IM 适配器若以自定义 `source.kind` 注入消息，把该 kind 加进列表即可（带 `form` 的插件上下文恒不算对话）；`intake.session.enabled: false` 可完全停写（检索通道不受影响）。
 
+### 推荐：本地部署 llama.cpp 替代云端 API（嵌入 + 重排）
+
+嵌入与重排不必走云端：插件默认的两个模型——`BAAI/bge-m3`（嵌入，1024 维，中英多语言）与 `BAAI/bge-reranker-v2-m3`（重排）——都有现成 GGUF 量化版，可用 [llama.cpp](https://github.com/ggml-org/llama.cpp) 在本机跑成 HTTP 服务。**推荐理由：零 API key、零按量计费、记忆数据不出本机**；纯 CPU 即可胜任（有 NVIDIA GPU 时换 CUDA 构建，自动加速）。llama.cpp 没有 GUI（不像 Ollama / LM Studio 一键起服务），下面把安装、模型下载、启动、验证、接入写成可整段交给 Agent 逐步执行的步骤；坚持用云端 SiliconFlow 的跳过本节，直接走下一节的步骤（只需两把 key）。
+
+**第 1 步 · 安装 llama.cpp**（任选其一）：
+
+```sh
+# Windows（winget，或从 GitHub Releases 下载预编译包解压，免安装）
+winget install llama.cpp
+#   Releases：https://github.com/ggml-org/llama.cpp/releases/latest
+#   有 NVIDIA GPU 选 llama-<版本>-bin-win-cuda-12.4-x64.zip；纯 CPU 选 …-bin-win-avx2-x64.zip
+
+# macOS（Homebrew）
+brew install llama.cpp
+
+# Linux（源码构建，需 cmake ≥ 3.14 与编译工具链）
+git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
+cmake -B build && cmake --build build -j --config Release   # 产物 build/bin/llama-server
+```
+
+完成判据：`llama-server --version` 打印版本号。下文命令假设它在 PATH 里；解压安装的把 `llama-server` 换成解压目录里的可执行文件路径即可。
+
+**第 2 步 · 下载两个 GGUF 模型**（与出厂默认的 SiliconFlow 模型同款，Q8_0 量化精度损失可忽略）：
+
+```sh
+mkdir -p models && cd models
+# 嵌入：llama.cpp 官方组织的 bge-m3 转换（Q8_0 约 0.6 GB）
+huggingface-cli download ggml-org/bge-m3-Q8_0-GGUF --local-dir .
+# 重排：常用的 bge-reranker-v2-m3 转换（Q8_0 约 0.6 GB）
+huggingface-cli download gpustack/bge-reranker-v2-m3-GGUF --local-dir .
+```
+
+- 国内网络不畅：先 `export HF_ENDPOINT=https://hf-mirror.com`（Windows PowerShell：`$env:HF_ENDPOINT='https://hf-mirror.com'`）再执行，或改用 ModelScope 等镜像站下载同款文件；
+- 完成判据：`models/` 下有 `bge-m3-Q8_0.gguf` 与 `bge-reranker-v2-m3-Q8_0.gguf`（具体文件名以仓库页为准）。
+
+**第 3 步 · 启动嵌入 server**（一个 llama-server 只能加载一个模型、一种池化，嵌入与重排要开**两个进程、两个端口**）：
+
+```sh
+llama-server -m models/bge-m3-Q8_0.gguf --embeddings --pooling cls -c 8192 --port 8080
+```
+
+- `--embeddings` 进入嵌入模式；`--pooling cls` 是 bge-m3 密向量的池化方式（新版会从 GGUF 元数据推断，显式写最稳）；`-c 8192` 是 bge-m3 原生上下文长度；CUDA 构建默认自动把全部层放上 GPU，无需额外参数；
+- 完成判据（另开一个终端执行）：
+
+```sh
+curl http://127.0.0.1:8080/v1/embeddings -H "Content-Type: application/json" \
+  -d '{"model":"bge-m3","input":["部署延迟与配置复杂性相关"]}'
+# → {"data":[{"embedding":[…共 1024 个数…],"index":0,…}]}
+```
+
+**第 4 步 · 启动重排 server**（第二个进程）：
+
+```sh
+llama-server -m models/bge-reranker-v2-m3-Q8_0.gguf --reranking --port 8081
+```
+
+- `--reranking` 进入重排模式并开放 Cohere/Jina 式 `/v1/rerank` 端点；llama.cpp 直接返回模型原始输出（logit 量纲），本插件检测到越出 [0,1] 的分数会自动做 sigmoid 归一，无需额外配置；
+- 完成判据：
+
+```sh
+curl http://127.0.0.1:8081/v1/rerank -H "Content-Type: application/json" \
+  -d '{"model":"reranker","query":"用什么数据库","documents":["生产数据库是 PostgreSQL","今天天气不错"]}'
+# → {"results":[{"index":0,"relevance_score":…},{"index":1,"relevance_score":…}]}
+#   相关文档（第 0 条）的分数应显著更高
+```
+
+**第 5 步 · 接入本插件**：把出厂默认的 SiliconFlow 端点换成两个本地 server。方式 A 改 `overlay.yml` 的 `config`；方式 B 在 profile patch 的 dsh-mem 条目 `config` 里改（覆盖会整体替换 config，须完整重述）：
+
+```yaml
+        embedding:
+          mode: http
+          endpoint: 'http://127.0.0.1:8080/v1/embeddings'
+          model: 'bge-m3'          # llama.cpp 不校验 model 字段，占位即可
+          dimensions: 1024         # bge-m3 密向量维度
+          apiKey: ''               # 本地服务无需鉴权，留空
+        reranker:
+          mode: http
+          endpoint: 'http://127.0.0.1:8081/v1/rerank'
+          model: 'reranker'
+          apiKey: ''
+```
+
+- 从 `deterministic` 切来：**必须先清库**——旧记录的嵌入是词袋哈希，换真实嵌入后是噪声（换嵌入模型属不兼容变更，全景图 B-5）：先停宿主进程（防 SQLITE_BUSY），删 `~/.dsh/storages/dsh_mem.sqlite`；
+- 从 SiliconFlow 的 bge-m3 切来：**也建议清库**——云端 f16 与本地 Q8_0 的向量分布有微小系统差，新旧混检会轻微劣化；新库从零积累没有迁移成本；
+- 内部判分 LLM（`llm.provider` / `llm.model`）走宿主 ctx.llm 适配器（如 `deepseek-official`），与嵌入/重排端点无关，不用改；
+- 完成判据：重启 `npx @deepseek-ai/dsh web` 后聊天 UI 出现 `memory_search` 工具卡片，对模型说「记住：我的生产数据库是 PostgreSQL」后库文件增长（同下一节第 4 步的三项确认）。
+
+**第 6 步 · 常驻运行**（日常使用建议）：两个 server 是普通前台进程——长期使用各开一个终端挂着，或注册成系统自启（Windows「任务计划程序」、Linux systemd、macOS launchd）。宿主运行中 server 掉线不致命：期间检索与写入会报 fetch 错误，server 拉起后自动恢复，宿主无需重启。
+
 ### 从冒烟到可用：切换真实端点（可整段交给 Agent 逐步执行）
 
 `deterministic` 冒烟只证明管线连通，**记不住语义**。以下把「切换真实端点 + 验证 + 使用约束」写成可执行步骤；全部改动只落在两个地方：profile patch 文件 `~/.dsh/profiles/web/cordis.patch.yml` 和（可选）一个库文件。每步带完成判据，Agent 可逐步自验。
@@ -104,7 +193,7 @@ dsh plugin --profile web add /Path/To/dsh_mem
           model: deepseek-v4-flash
 ```
 
-`endpoint` / `model` / `dimensions` 不必写（出厂默认即 SiliconFlow `bge-m3`·1024 / `bge-reranker-v2-m3`）。完成判据：重启 `npx @deepseek-ai/dsh web` 后聊天 UI 出现 `memory_search` 工具卡片。
+`endpoint` / `model` / `dimensions` 不必写（出厂默认即 SiliconFlow `bge-m3`·1024 / `bge-reranker-v2-m3`）。走本地 llama.cpp 的不用这两把 key：把 `embedding` / `reranker` 两段换成「推荐：本地部署 llama.cpp」第 5 步的端点配置即可。完成判据：重启 `npx @deepseek-ai/dsh web` 后聊天 UI 出现 `memory_search` 工具卡片。
 
 **第 3 步 · 清理 deterministic 时代的旧库**（此前用 deterministic 跑过对话才需要）：旧记录的嵌入是词袋哈希，换真实嵌入后是噪声（换嵌入模型属不兼容变更，全景图 B-5）。**先停宿主进程**（防 SQLITE_BUSY），删除 `~/.dsh/storages/dsh_mem.sqlite`。没有免清理的迁移：把 `storage.version` 改成 `2` 只会让旧介质开库报 `version-mismatch`（那是强制清理的信号），最终仍要删库。
 
@@ -122,10 +211,10 @@ dsh plugin --profile web add /Path/To/dsh_mem
 
 ### 确认插件在跑
 
-- 启动日志：`[dsh-mem] started: backend=…, workspaceScope=…`；首个会话事件后：`scope opened: unit=… (N valid memories)`；
+- 启动日志：`[dsh-mem] started: backend=…, workspaceScope=…, clearTool=…`；首个会话事件后：`scope opened: unit=… (N valid memories)`；
 - 每轮 `turn/end` 后（有写入时）：`turn N: wrote X, superseded Y, dropped Z`；
 - 睡眠周期触发后：`sleep cycle: C clusters (M migrated, G gated), refreshed R records / N nodes, decayed R'/N'`；
-- 聊天 UI 出现 `memory_search` 工具卡片；库非空且命中时，`memory_search` 结果与自动记忆 section 出现在上下文（语义节点带 `gist` 标记）；
+- 聊天 UI 出现 `memory_search` 工具卡片（开启 `tool.clear` 后另有 `memory_clear` 卡片）；库非空且命中时，`memory_search` 结果与自动记忆 section 出现在上下文（语义节点带 `gist` 标记）；
 - storage 介质上出现 unit：json 后端每 unit 一个 `~/.dsh/storages/<unit>.json`；sqlite 后端全部 unit 在同一 `<path>.sqlite` 内（表名 `u_<unit>_episodic` / `u_<unit>_semantic`）。
 
 ## 产出结果
@@ -159,6 +248,20 @@ Relevant long-term memories (semantic retrieval; recency was not a factor):
   ],
   "suppressedCount": 2
 }
+```
+
+### 2a. `memory_clear` 工具（开发/测试用，默认关闭）
+
+`config.tool.clear: true` 开启后，聊天 UI 出现 `memory_clear` 卡片：一次性**硬删除当前工作区记忆库的双表全部内容**（含被取代与已归档的记忆），**时间旅行（`at`）也不可回溯**——全系统唯一违反「记录永不删除」的操作，仅供测试迭代快速清库；生产 profile 保持默认关闭，跨工作区全清仍以删介质文件为准。
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `confirm` | boolean，必填 | 必须严格为 `true`：缺失由宿主参数校验拒绝；`false` 返回规范 error 值且不触碰存储 |
+
+返回单个规范 JSON 值（删除计数）：
+
+```json
+{ "episodic": 3, "semantic": 2, "total": 5 }
 ```
 
 ### 3. 持久记忆库（经宿主 ctx.storage 持久化，介质由存储后端决定）
@@ -219,10 +322,11 @@ turn/end 信号门控触发（自上次周期新写入 ≥ `sleep.minNewMemories
 |---|---|
 | `src/` | 插件源码（模块地图见[开发](#开发)） |
 | `lib/` | `npm run build` 产物（ESM + .d.ts） |
-| `tests/` | 202 个离线单测（vitest，无需网络与 API key） |
+| `tests/` | 211 个离线单测（vitest，无需网络与 API key） |
 | `scripts/eval-ndcg.mjs` | §7.1 检索四档消融脚手架 |
 | `scripts/eval-sleep.mjs` | P1 睡眠周期脚手架（QA 保留率、压缩后召回存续） |
 | `scripts/eval-semtime.mjs` | P2 语义 vs 时间消融脚手架（§7.4 关键消融 + 时间旅行） |
+| `benchmark/` | 性能与空间基准套件（插入/检索/写入/睡眠/空间五项，对 `lib/` 构建产物计时，含真实 sqlite 后端）——实测数字、四堵规模墙与优化优先级见 `benchmark/README.md` |
 | `data/` | 示例语料与查询集（格式见[评测](#评测ndcg-四档消融)） |
 | `docs/` | 设计文档（定稿）、`docs/architecture/插件工作原理全景图.md`（内部细节唯一引用点）、dsh 官方文档镜像 `docs/ref/`、立项认知机制对话 `1.md` |
 | `cordis.patch.yml` | 组合包 patch（`dsh plugin add` 时使用） |
@@ -232,7 +336,7 @@ turn/end 信号门控触发（自上次周期新写入 ≥ `sleep.minNewMemories
 | 门禁 | 结果 |
 |---|---|
 | `npm run typecheck`（strict + noUncheckedIndexedAccess） | 0 错误 |
-| `npm test` | 202/202 通过 |
+| `npm test` | 211/211 通过 |
 | `npm run build` → `lib/` | 通过；`node` 导入 `lib/index.js` 与 Config 默认值校验通过 |
 | 非法配置响亮失败 | Schema 加载时抛 `ValidationError`（如 `score.useGain: "not-a-number"`） |
 | sqlite 后端探针（M1） | headless one-shot 实测：后端注册 → kv.open → putRecord/loadAll 往返（嵌套 JSON 完好） |
@@ -240,6 +344,7 @@ turn/end 信号门控触发（自上次周期新写入 ≥ `sleep.minNewMemories
 | eval-ndcg 冒烟（deterministic 替身） | 四档管线全部跑通（数值无语义意义） |
 | eval-sleep 冒烟（echo LLM + deterministic 替身） | 聚类→gist→QA→迁移→统计刷新→S 衰减全链路跑通（数值无语义意义） |
 | eval-semtime 冒烟（deterministic 替身） | semantic / time / ga-product 三臂 + 时间旅行复活计数跑通（数值无语义意义） |
+| 性能与空间基准（benchmark/，真实 sqlite 后端） | 五项全绿：put O(1)（sqlite ~3k ops/s）/ 检索全管线 O(N)（2 万条 93ms、QPS 11）/ 每轮写入 O(N·c)（1 万条库 c=4 约 0.42s）/ 睡眠聚类 O(N²)（≈21–25 万对/s）/ sqlite 体积 = 紧凑 JSON×1.29、嵌入占逻辑负载 83.5%（int8+base64 量化假设 −41%）；规模墙与优化建议见 `benchmark/README.md`（全景图 F-14） |
 
 **尚未验证**（需外部资源，见验收目标）：真实嵌入/重排端点下的 nDCG 与语义 vs 时间消融数字、M5 判分与人工标注的 Spearman ρ > 0.7、真实 LLM 下 QA 闸门保留率 ≥ 0.8 与长程问答提升、messageFeedback"被采纳"确认制接线（message-feedback 包类型进入依赖集后），以及长驻宿主中跨工作区的完整对话验证（M2 的路由已在 headless 实测；headless 一次性进程的写入退出竞态见全景图 F-13）。
 
@@ -338,7 +443,7 @@ time-anchored queries: 1 (resurfaced relevant ids via time travel: 1)
 ```sh
 npm install
 npm run typecheck                          # tsc --noEmit
-npm test                                   # vitest run（全部 202 个）
+npm test                                   # vitest run（全部 211 个）
 npx vitest run tests/sleep-cycle.test.ts   # 单文件
 npm run build                              # 产出 lib/
 ```
@@ -361,7 +466,7 @@ src/
   write-path.ts   写入管线（§5.1 七步 + §2.5 完整版：时间重叠闸 + 语义节点软失效；单候选失败不中断整轮）
   sleep-cycle.ts  睡眠巩固周期（§2.3 七步 + 第 7 步 S 兜底衰减；迁移带 compressed_at 归档时点）
   runtime.ts      编排：会话观察、agent 定域自动注入、ScoreKeeper 记账接线、睡眠周期触发
-  tool.ts         memory_search 工具（含 at 时间旅行参数）+ section 文本渲染
+  tool.ts         memory_search 工具（含 at 时间旅行参数）+ memory_clear（开发/测试硬删除，默认关）+ section 文本渲染
 ```
 
 实现选择说明：自动注入落在 `system-prompt/assemble` waterfall（agent 定域注册）而非 `ctx.systemPrompt.section()`——后者 text provider 是同步签名，承载不了异步检索链路；前者为官方文档同章节列出的扩展点。检索查询取自 `agent/inbox/claimed` 的待处理输入 ⊕ 最近对话尾部。
@@ -372,8 +477,8 @@ src/
 |---|---|
 | `storage.backend` / `unit` / `version` / `workspaceScope`(true) | KV 后端名（json/sqlite）、unit 名前缀与无 cwd 回退名（**不含连字符**，规则同宿主 `/^[a-z][a-z0-9_]*$/`，连字符会被归一为下划线）、格式版本、按工作区一区一库开关（false = 全局单库旧行为；工作区 unit 名 = `<unit>_ws_<路径哈希>`） |
 | `intake.session.enabled`(true) / `acceptSourceKinds`(['user']) | 会话历史入口：停写开关（检索不受影响）与"什么算人类输入"的 source.kind 白名单（IM 适配器自定义 kind 加进列表即可；带 `form` 的插件上下文恒不算对话） |
-| `embedding.*` | mode(http/deterministic)、endpoint、model、apiKey、dimensions(1024)、batchSize |
-| `reranker.*` | 同上（无 dimensions） |
+| `embedding.*` | mode(http/deterministic)、endpoint、model、apiKey、dimensions(1024)、batchSize——endpoint 出厂默认 SiliconFlow；本地 llama.cpp 为 `http://127.0.0.1:8080/v1/embeddings`（见「推荐：本地部署 llama.cpp」） |
+| `reranker.*` | 同上（无 dimensions；本地 llama.cpp 为 `http://127.0.0.1:8081/v1/rerank`） |
 | `llm.provider` / `model` / `temperature`(0) / `maxTokens` | 内部判分调用（经 ctx.llm） |
 | `write.messageWindow`(10) / `maxCandidates`(8) / `minImportance`(3) / `contradictionTopK`(5) / `contradictionMinCos`(0.8) | 写入路径 |
 | `retrieval.l0TopK`(100) / `cslsTopK`(20) / `rerankTopK`(8) / `mmrTopK`(5) / `mmrLambda`(0.6) / `cslsK`(10) / `contextTurns`(3) / `coldCueBoost`(0.1) / `cueThreshold`(0.3) | 检索链路 |
@@ -385,7 +490,7 @@ src/
 | `sleep.epiThreshold`(0.5) | gist 的 M6 epi 迁移阈值（低于才迁语义层） |
 | `sleep.conWindow`(1000) / `conAttachSigma`(0.5) / `conNewNodeSigma`(−1) / `conNewNodeMinImp`(7) / `attachGain`(0.5) | M4 路由：z 基线窗口与三档路由阈值、挂入增益 |
 | `section.enabled` / `maxMemories`(5) / `header` | 自动注入通道 |
-| `tool.enabled` / `maxResults`(5) | memory_search 工具 |
+| `tool.enabled` / `maxResults`(5) / `clear`(false) | memory_search 工具；`clear` 开启 `memory_clear`（按工作区硬删除全部长期记忆的开发/测试工具，唯一违反「永不删除」的操作，仅供测试迭代） |
 
 ## 排障
 
@@ -398,14 +503,18 @@ src/
 | 打开 unit 报 `version-mismatch` | `config.storage.version` 与介质上既有版本不一致；P1 仅向记录新增可选字段（旧记录缺字段按 undefined 容忍），保持 version=1 即可 |
 | 判分调用失败（NO_ADAPTER / 空回复 / error finish） | `llm.provider` 未注册适配器或凭据失效；llm.ts 会抛出携带失败码的错误，见 dsh 日志 |
 | 嵌入/重排 401、超时 | 核对 apiKey、endpoint、网络；临时可切 `deterministic` 模式隔离问题 |
+| 本地 llama.cpp 报 `fetch failed` / ECONNREFUSED | 对应端口的 server 没起来（嵌入 8080 / 重排 8081，按部署节第 3/4 步的 curl 自验）或端口写错；server 拉起后宿主自动恢复，无需重启 |
+| 本地 rerank 排名异常 / 分数全挤在一起 | llama.cpp 版本过旧的 rerank 已知缺陷，升级到最新 release；本插件会把越出 [0,1] 的原始 logit 自动 sigmoid 归一，正常无需干预 |
+| llama-server 启动即退出 / 嵌入质量异常 | 模式旗标用错：嵌入用 `--embeddings --pooling cls`，重排用 `--reranking`；并确认 GGUF 下载完整（中断会产生半个文件，重下） |
 | 睡眠周期从不触发 | `sleep.enabled` 为 false、新写入未达 `sleep.minNewMemories`、或聚类池小于 `clusterMinSize`；看启动后是否有 `sleep cycle:` 日志 |
 | 睡眠周期全部 gated（qa_failed） | QA 闸门在拒绝：gist 质量不足（换更强判分模型）或 `qaF1Threshold` 过严；被拒簇已标 incompressible，需新成员加入才重试 |
 | 压缩后检索不到原细节 | 设计行为：成员内容由节点 gist 承载（§2.3"记住要点、忘掉细节"）；回溯经 `flags.compressed_into` 索引原记录，或用 `memory_search` 的 `at` 参数在归档前的时点检索 |
 | 记忆还在但排不上名 | tier 可能已沉到 cold（S 动态：长期未使用 + 兜底衰减）：cold 项需 CSLS cue ≥ `cueThreshold + coldCueBoost` 才保留；调 `tier.coldThreshold` / `score.decayTauDays`，或等使用事件把它推回 warm |
 | `memory_search` 返回 `invalid 'at'` | `at` 需为 ISO 8601（以 4 位年份开头）或正整数 epoch ms；领域级错误写进规范值，不影响工具通道 |
+| 聊天 UI 没有 `memory_clear` 工具卡片 | 默认关闭（破坏性工具）：config 加 `tool: { clear: true }`（HMR 即生效），启动日志 `clearTool=true` 旁证；它只清**当前工作区**的库，换嵌入模型/版本迁移等全清场景仍以删介质文件为准 |
 
 ## 明确不在 P2（后续里程碑）
 
 messageFeedback"被采纳"确认制（S 增益目前按"未被纠正"默认即时入账，§5.0 所列 seam 的类型不在依赖集内）、LoCoMo 式活宿主端到端回放；语义图 PPR 联想检索、spacing 加权、sur、valence 情绪一致性检索（P3，设计 §6/§10）。
 
-已知接受的取舍（P2）：跨写链并发 `updateRecord` 的丢失更新窗口延续 P1 声明（最坏一次 flag/计数/S 增量，可被下一周期自愈）；写入路径与睡眠周期可并发写同一 unit 的不同记录（KvUnit 单调用原子、整链不串行是宿主契约给调用方的自由度）；兜底衰减与全库统计刷新同门控（`sleep.enabled=false` 时离线维护整体停摆，事件路径的惰性衰减追补仍然生效）。
+已知接受的取舍（P2）：跨写链并发 `updateRecord` 的丢失更新窗口延续 P1 声明（最坏一次 flag/计数/S 增量，可被下一周期自愈）；写入路径与睡眠周期可并发写同一 unit 的不同记录（KvUnit 单调用原子、整链不串行是宿主契约给调用方的自由度）；兜底衰减与全库统计刷新同门控（`sleep.enabled=false` 时离线维护整体停摆，事件路径的惰性衰减追补仍然生效）。另：`memory_clear`（`tool.clear` 开启时）是全库唯一硬删除路径（「永不删除」的唯一例外），按作用域清库、时间旅行不可回溯，仅供测试迭代（全景图 §9.4）。

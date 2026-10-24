@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createEmbeddingProvider, createRerankerProvider } from '../src/embedding.js'
+import { sigmoid } from '../src/metrics.js'
 import type { EmbeddingConfig, HttpModelConfig } from '../src/config.js'
 
 const embedConfig = (over: Partial<EmbeddingConfig> = {}): EmbeddingConfig => ({
@@ -160,7 +161,7 @@ describe('http 嵌入', () => {
 describe('http 重排', () => {
   afterEach(() => vi.unstubAllGlobals())
 
-  it('请求体形状、按 index 回填并 clamp 到 [0,1]', async () => {
+  it('请求体形状、整组 [0,1] 视为已归一按 index 原样回填', async () => {
     const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
       const body = JSON.parse(String(init.body))
       expect(body.query).toBe('q')
@@ -168,16 +169,31 @@ describe('http 重排', () => {
       expect(body.top_n).toBe(3)
       return new Response(JSON.stringify({
         results: [
-          { index: 2, relevance_score: 1.7 },
+          { index: 2, relevance_score: 0.9 },
           { index: 0, relevance_score: 0.42 },
-          { index: 1, relevance_score: -0.3 },
+          { index: 1, relevance_score: 0.0 },
         ],
       }), { status: 200 })
     })
     vi.stubGlobal('fetch', fetchMock)
     const embedding = createEmbeddingProvider(embedConfig())
     const reranker = createRerankerProvider(rerankConfig({ mode: 'http', endpoint: 'https://rr.test/v1/rerank' }), embedding)
-    expect(await reranker.rerank('q', ['d0', 'd1', 'd2'])).toEqual([0.42, 0, 1])
+    expect(await reranker.rerank('q', ['d0', 'd1', 'd2'])).toEqual([0.42, 0, 0.9])
+  })
+
+  it('llama.cpp 式原始 logit 响应（任一越界）：整组 sigmoid 归一', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      results: [
+        { index: 2, relevance_score: 1.7 },
+        { index: 0, relevance_score: -0.3 },
+        { index: 1, relevance_score: 0.42 },
+      ],
+    }), { status: 200 })))
+    const embedding = createEmbeddingProvider(embedConfig())
+    const reranker = createRerankerProvider(rerankConfig({ mode: 'http', endpoint: 'http://127.0.0.1:8081/v1/rerank' }), embedding)
+    expect(await reranker.rerank('q', ['d0', 'd1', 'd2'])).toEqual([
+      sigmoid(-0.3), sigmoid(0.42), sigmoid(1.7),
+    ])
   })
 
   it('响应缺 results 字段抛错；fetch 网络异常上抛', async () => {

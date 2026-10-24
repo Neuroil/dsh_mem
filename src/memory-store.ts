@@ -440,6 +440,30 @@ export class MemoryStore {
     return r_m
   }
 
+  /**
+   * 清空本 unit 的全部记忆（`memory_clear` 工具的后端）：对双表逐键
+   * deleteRecord **硬删除**——含软失效与已压缩归档记录，时间旅行也不可回溯。
+   * 这是全库唯一违反「记录永不删除」（§2.5）的操作，仅由 config.tool.clear
+   * 显式开启的开发/测试工具触达。写入顺序沿用「先持久化、后改内存镜像」。
+   * 返回删除的记录/节点数；空库是干净的无操作。
+   */
+  async clearAll(): Promise<{ episodic: number; semantic: number }> {
+    this.assertOpen()
+    const recordIds = [...this.records.keys()]
+    for (const id of recordIds) await this.unit.deleteRecord(TABLE_EPISODIC, id)
+    const nodeIds = [...this.nodes.keys()]
+    for (const id of nodeIds) await this.unit.deleteRecord(TABLE_SEMANTIC, id)
+    for (const id of recordIds) {
+      this.records.delete(id)
+      this.index.remove(id)
+    }
+    for (const id of nodeIds) {
+      this.nodes.delete(id)
+      this.index.remove(id)
+    }
+    return { episodic: recordIds.length, semantic: nodeIds.length }
+  }
+
   /** 检索宇宙内 top-k / top-5 邻域统计（排除自身；不足取实际数，空集为 0）。 */
   private neighborhoodStats(
     vector: readonly number[],
