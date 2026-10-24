@@ -1,9 +1,9 @@
 # dsh-mem — 语义驱动记忆插件（DeepSeek Harness）
 
 > 核心立场：**遗忘与巩固由语义而非时间决定。时间戳只作为元数据保存，永不作为衰减/删除的驱动。**
-> 设计文档：`docs/design/语义驱动记忆系统设计.md`（定稿 v1.0）。本包实现其 **P0 + P1 + P2** 里程碑。
+> 设计文档：`docs/design/语义驱动记忆系统设计.md`（定稿 v1.0）。本包实现其 **P0 + P1 + P2** 里程碑，另交付 **M1/M2/M3**（sqlite 存储后端、按工作区隔离记忆、会话历史入口可配置化）。
 
-一句话：一个 Cordis 插件，监听会话日志，把值得记的内容（经 M5 rubric 判分）连同嵌入向量写入持久记忆库；每次模型请求前按语义检索（余弦召回 + CSLS + 精排 + MMR）注入最相关的记忆；矛盾的新记忆把旧记忆**或语义节点**软失效（不删除，且只对时间上重叠的矛盾生效）；每次记忆进入最终上下文都按线索质量巩固其分数 S、被竞争压制的按小权重衰减、睡眠周期对全库施加慢兜底衰减——S 决定 hot/warm/cold 分层而非删除；离线"睡眠"周期把冗余的情景簇蒸馏成语义 gist 节点（聚类 → gist → QA 闸门 → M4 路由 → M6 评估 → 迁移），原始记忆压缩归档；`memory_search` 支持 `at` 时间旅行参数，可检索任意历史时点的记忆状态。时间从不参与排序或删除决策（唯一例外是慢兜底衰减，且只影响分层、永不删除）。
+一句话：一个 Cordis 插件，监听会话日志，把值得记的内容（经 M5 rubric 判分）连同嵌入向量写入持久记忆库——**每个工作区（会话创建目录）一个独立记忆库（M2）**；每次模型请求前按语义检索（余弦召回 + CSLS + 精排 + MMR）注入最相关的记忆；矛盾的新记忆把旧记忆**或语义节点**软失效（不删除，且只对时间上重叠的矛盾生效）；每次记忆进入最终上下文都按线索质量巩固其分数 S、被竞争压制的按小权重衰减、睡眠周期对全库施加慢兜底衰减——S 决定 hot/warm/cold 分层而非删除；离线"睡眠"周期把冗余的情景簇蒸馏成语义 gist 节点（聚类 → gist → QA 闸门 → M4 路由 → M6 评估 → 迁移），原始记忆压缩归档；`memory_search` 支持 `at` 时间旅行参数，可检索任意历史时点的记忆状态。时间从不参与排序或删除决策（唯一例外是慢兜底衰减，且只影响分层、永不删除）。
 
 ## 产出结果
 
@@ -40,7 +40,9 @@ Relevant long-term memories (semantic retrieval; recency was not a factor):
 
 ### 3. 持久记忆库（ctx.storage，不自建数据库）
 
-- KV unit（默认名 `dsh_mem`，`config.storage.unit` 可改；unit 名只允许小写字母/数字/下划线，**不允许连字符**——宿主规则 `/^[a-z][a-z0-9_]*$/`），两张表：`episodic`（MemoryRecord）与 `semantic`（SemanticNode，睡眠周期填充）。
+- **按工作区隔离（M2）**：记忆库的 scope = 会话创建时的工作目录（`session.header.cwd`，宿主验证过的绝对路径）。每个工作区一个 KV unit（`<unit>_ws_<8位哈希>`，路径归一化后 FNV-1a），写入/检索/睡眠/计分全套按作用域独立——**物理隔离，跨工作区不可能串库**。无 cwd 的会话（如部分 headless 场景）回退到 `config.storage.unit` 本名；`storage.workspaceScope: false` 可恢复全局单库旧行为。
+- **存储后端（M1）**：生产推荐 `sqlite`（`dsh-storage-sqlite`，一个库文件承载全部 unit，消灭 json 后端 pretty-print 的体积膨胀；安装需与宿主版本精确对齐，见[前置条件](#前置条件)）；json 后端保留为回退与测试用途。
+- KV unit（前缀默认 `dsh_mem`，`config.storage.unit` 可改；unit 名只允许小写字母/数字/下划线，**不允许连字符**——宿主规则 `/^[a-z][a-z0-9_]*$/`），两张表：`episodic`（MemoryRecord）与 `semantic`（SemanticNode，睡眠周期填充）。
 - 记录含 M5 判分（imp/valence/arousal/reasons）、邻域统计（r_m/red）、巩固分数 S、分层 tier（hot/warm/cold）、使用计数（used_count/suppressed_count/last_used_at/last_cue_quality/last_decay_at）——计数自 P2 起被 S 动态消费；语义节点带同构的可选 counters。
 - **软失效**：被取代的记录或语义节点只设 `invalid_at` / `superseded_by` 并移出检索索引，永不删除。矛盾判定带**时间重叠闸**（§2.5 完整版）：只对同一时间框架的矛盾软失效，"过去用 MySQL"与"现在用 PostgreSQL"这类不同时期的矛盾两条都保留。
 - **压缩归档**（P1）：被语义节点吸收的记录设 `flags.compressed_into` / `qa_passed` 与 `time_meta.compressed_at`（归档时点，时间旅行消费）并退出检索池；QA/epi 闸门拒收的簇标 `flags.incompressible`，全簇已标时需新成员加入才重试。
@@ -92,7 +94,7 @@ turn/end 信号门控触发（自上次周期新写入 ≥ `sleep.minNewMemories
 |---|---|
 | `src/` | 插件源码（模块地图见[开发](#开发)） |
 | `lib/` | `npm run build` 产物（ESM + .d.ts） |
-| `tests/` | 180 个离线单测（vitest，无需网络与 API key） |
+| `tests/` | 202 个离线单测（vitest，无需网络与 API key） |
 | `scripts/eval-ndcg.mjs` | §7.1 检索四档消融脚手架 |
 | `scripts/eval-sleep.mjs` | P1 睡眠周期脚手架（QA 保留率、压缩后召回存续） |
 | `scripts/eval-semtime.mjs` | P2 语义 vs 时间消融脚手架（§7.4 关键消融 + 时间旅行） |
@@ -105,21 +107,23 @@ turn/end 信号门控触发（自上次周期新写入 ≥ `sleep.minNewMemories
 | 门禁 | 结果 |
 |---|---|
 | `npm run typecheck`（strict + noUncheckedIndexedAccess） | 0 错误 |
-| `npm test` | 180/180 通过 |
+| `npm test` | 202/202 通过 |
 | `npm run build` → `lib/` | 通过；`node` 导入 `lib/index.js` 与 Config 默认值校验通过 |
 | 非法配置响亮失败 | Schema 加载时抛 `ValidationError`（如 `score.useGain: "not-a-number"`） |
+| sqlite 后端探针（M1） | headless one-shot 实测：后端注册 → kv.open → putRecord/loadAll 往返（嵌套 JSON 完好） |
+| 双工作区路由（M2） | 从两个不同 cwd 各跑一轮 headless 对话：开出两个哈希与 scope.ts 预期**逐字符一致**的工作区 unit；回退 unit 存在且空 |
 | eval-ndcg 冒烟（deterministic 替身） | 四档管线全部跑通（数值无语义意义） |
 | eval-sleep 冒烟（echo LLM + deterministic 替身） | 聚类→gist→QA→迁移→统计刷新→S 衰减全链路跑通（数值无语义意义） |
 | eval-semtime 冒烟（deterministic 替身） | semantic / time / ga-product 三臂 + 时间旅行复活计数跑通（数值无语义意义） |
 
-**尚未验证**（需外部资源，见验收目标）：真实嵌入/重排端点下的 nDCG 与语义 vs 时间消融数字、M5 判分与人工标注的 Spearman ρ > 0.7、真实 LLM 下 QA 闸门保留率 ≥ 0.8 与长程问答提升、messageFeedback"被采纳"确认制接线（message-feedback 包类型进入依赖集后），以及在真实 dsh 宿主中的端到端会话运行（本包的宿主对接均已对照 npm 上 `@deepseek-ai/*` 真实类型定义编写并通过类型检查，但未在活的 harness 进程里跑过）。
+**尚未验证**（需外部资源，见验收目标）：真实嵌入/重排端点下的 nDCG 与语义 vs 时间消融数字、M5 判分与人工标注的 Spearman ρ > 0.7、真实 LLM 下 QA 闸门保留率 ≥ 0.8 与长程问答提升、messageFeedback"被采纳"确认制接线（message-feedback 包类型进入依赖集后），以及长驻宿主中跨工作区的完整对话验证（M2 的路由已在 headless 实测；headless 一次性进程的写入退出竞态见全景图 F-13）。
 
 ## 使用方法
 
 ### 前置条件
 
 - Node ≥ 20；dsh 运行环境（`npx @deepseek-ai/dsh web`）。
-- profile 里有 **storage 后端**（dsh-base 自带持久化层；纯自定义组合需自装 `@deepseek-ai/dsh-storage-json` 或 `dsh-storage-sqlite`）与 **llm 适配器**（如 `dsh-llm-deepseek` + 凭据）。
+- profile 里有 **storage 后端**（dsh-base 自带 json 后端；**推荐安装 sqlite 后端**：`dsh plugin --profile web add @deepseek-ai/dsh-storage-sqlite@<与宿主一致的版本>`——宿主 plugin 管理器按 peer 依赖做精确版本闸（如宿主 0.2.1-rc.2 就装 0.2.1-rc.2，装 0.2.1-rc.3 会被拒），装完在 profile patch 里加挂载行并在本插件 config 里 `storage.backend: sqlite`）与 **llm 适配器**（如 `dsh-llm-deepseek` + 凭据）。
 - 嵌入/重排端点的 API key（默认指向 SiliconFlow 的 bge-m3 / bge-reranker-v2-m3）。没有 key 可先用 `deterministic` 模式冒烟（离线替身，验证管线不验证语义）。
 
 ### 方式 A：本地源码加载（开发）
@@ -160,15 +164,18 @@ dsh plugin --profile web add C:/Users/you/Code/dsh_mem
 其余全部有 schema 默认值，通常只需：
 
 1. `embedding.apiKey` + `reranker.apiKey`（或两者 `mode: deterministic`）；
-2. `llm.provider` / `llm.model`：M5 判分与矛盾判定的调用路由，**必须是 ctx.llm 上已注册适配器的 provider 名**，模型随之有可用凭据。
+2. `llm.provider` / `llm.model`：M5 判分与矛盾判定的调用路由，**必须是 ctx.llm 上已注册适配器的 provider 名**，模型随之有可用凭据；
+3. 切 sqlite 后端（可选但推荐）：profile patch 挂 `@deepseek-ai/dsh-storage-sqlite` 行（config 带 `path`，如 `!!js dshHomePath('storages/dsh_mem.sqlite')`）+ 本插件 `storage.backend: sqlite`。
+
+**记忆隔离与入口（M2/M3）默认即所需行为**：`storage.workspaceScope: true` = 每工作区一库（QQ bot 等以适配器接入的会话自动归属其运行目录的工作区）；`intake.session.acceptSourceKinds: ['user']` = 只有用户消息算人类输入——IM 适配器若以自定义 `source.kind` 注入消息，把该 kind 加进列表即可（带 `form` 的插件上下文恒不算对话）；`intake.session.enabled: false` 可完全停写（检索通道不受影响）。
 
 ### 确认插件在跑
 
-- 启动日志：`[dsh-mem] started: 0 valid memories in store`；
+- 启动日志：`[dsh-mem] started: backend=…, workspaceScope=…`；首个会话事件后：`scope opened: unit=… (N valid memories)`；
 - 每轮 `turn/end` 后（有写入时）：`turn N: wrote X, superseded Y, dropped Z`；
 - 睡眠周期触发后：`sleep cycle: C clusters (M migrated, G gated), refreshed R records / N nodes, decayed R'/N'`；
 - 聊天 UI 出现 `memory_search` 工具卡片；库非空且命中时，`memory_search` 结果与自动记忆 section 出现在上下文（语义节点带 `gist` 标记）；
-- storage 后端介质上出现 `dsh_mem` unit。
+- storage 介质上出现 unit：json 后端每 unit 一个 `~/.dsh/storages/<unit>.json`；sqlite 后端全部 unit 在同一 `<path>.sqlite` 内（表名 `u_<unit>_episodic` / `u_<unit>_semantic`）。
 
 ## 评测：nDCG 四档消融（设计 §7.1）
 
@@ -296,7 +303,8 @@ src/
 
 | 键 | 说明 |
 |---|---|
-| `storage.backend` / `unit` / `version` | KV 后端名（json/sqlite）、unit 名（**不含连字符**，规则同宿主 `/^[a-z][a-z0-9_]*$/`，连字符会被归一为下划线）、格式版本 |
+| `storage.backend` / `unit` / `version` / `workspaceScope`(true) | KV 后端名（json/sqlite）、unit 名前缀与无 cwd 回退名（**不含连字符**，规则同宿主 `/^[a-z][a-z0-9_]*$/`，连字符会被归一为下划线）、格式版本、按工作区一区一库开关（false = 全局单库旧行为；工作区 unit 名 = `<unit>_ws_<路径哈希>`） |
+| `intake.session.enabled`(true) / `acceptSourceKinds`(['user']) | 会话历史入口：停写开关（检索不受影响）与"什么算人类输入"的 source.kind 白名单（IM 适配器自定义 kind 加进列表即可；带 `form` 的插件上下文恒不算对话） |
 | `embedding.*` | mode(http/deterministic)、endpoint、model、apiKey、dimensions(1024)、batchSize |
 | `reranker.*` | 同上（无 dimensions） |
 | `llm.provider` / `model` / `temperature`(0) / `maxTokens` | 内部判分调用（经 ctx.llm） |
@@ -317,6 +325,8 @@ src/
 | 现象 | 原因与处理 |
 |---|---|
 | 启动报 `storage backend '…' provides no kv facet` | profile 没有 storage 后端或 `storage.backend` 名不对：装 `dsh-storage-json`/`dsh-storage-sqlite` 并核对注册名 |
+| `dsh plugin add` 装 sqlite 后端被拒（incompatible / peer 闸） | 版本须与宿主**精确一致**（宿主 `dsh --version` 是 0.2.1-rc.2 就装 `@deepseek-ai/dsh-storage-sqlite@0.2.1-rc.2`）；报错信息里会给出 `allow-version` 豁免命令，但存储层不建议豁免版本差 |
+| sqlite 写入报 SQLITE_BUSY | 同一库文件被两个进程同时写（如 web GUI 与 headless --patch 并行）：后端无 busy-wait/重试，保持"一个 profile 一个进程" |
 | 插件停在 PENDING 不加载 | `inject` 的服务（storage/llm/tools/systemPrompt/sessions）缺提供方；查 `--dump-config` 与启动日志 |
 | 打开 unit 报 `version-mismatch` | `config.storage.version` 与介质上既有版本不一致；P1 仅向记录新增可选字段（旧记录缺字段按 undefined 容忍），保持 version=1 即可 |
 | 判分调用失败（NO_ADAPTER / 空回复 / error finish） | `llm.provider` 未注册适配器或凭据失效；llm.ts 会抛出携带失败码的错误，见 dsh 日志 |
