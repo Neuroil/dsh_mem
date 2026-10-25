@@ -17,7 +17,7 @@
 | 2 | dsh 宿主 | `npx @deepseek-ai/dsh web` 可启动并进入聊天 UI | npm（DeepSeek 官方包） | 无运行环境 |
 | 3 | 存储后端 | 二选一：json（dsh-base 自带，零安装）；或 **sqlite（推荐）** `@deepseek-ai/dsh-storage-sqlite`，版本与宿主**逐位一致**（宿主 0.2.1-rc.2 就装 0.2.1-rc.2；装 0.2.1-rc.3 会被 peer 闸拒） | `dsh plugin --profile web add @deepseek-ai/dsh-storage-sqlite@<宿主版本>`（宿主版本用 `dsh --version` 查） | 插件启动报 `provides no kv facet`，完全不加载 |
 | 4 | LLM 适配器 + 凭据 | 一个已在 ctx.llm **注册的 provider 名**与有凭据的模型：`dsh-llm-deepseek` 注册名为 `deepseek-official`，模型 `deepseek-v4-flash` / `deepseek-v4-pro`（本插件 schema 默认的 `deepseek` / `deepseek-chat` **不在注册表**，必须覆盖） | 适配器随 dsh base bundle；凭据入宿主凭据文件 `~/.dsh/.credentials.yaml`（refs 指向 `DEEPSEEK_API_KEY`） | 判分/矛盾判定/抽取全部失败（NO_ADAPTER），写入管线空转 |
-| 5 | 嵌入端点 | **推荐本地 llama.cpp**（零 key、离线、免费；部署步骤见下文「[推荐：本地部署 llama.cpp](#推荐本地部署-llamacpp-替代云端-api嵌入--重排)」一节）——插件默认模型 `BAAI/bge-m3`（1024 维，多语言）有现成 GGUF。云端替代：SiliconFlow key（siliconflow.cn 控制台申请） | 下节 / siliconflow.cn | 只能以 `deterministic` 冒烟（验证管线、无语义） |
+| 5 | 嵌入端点 | **推荐本地 llama.cpp**（零 key、离线、免费；部署步骤见下文「[推荐：本地部署 llama.cpp](#推荐本地部署-llamacpp-替代云端-api嵌入--重排)」一节，**含启动脚本——server 须先于宿主跑起来**）——插件默认模型 `BAAI/bge-m3`（1024 维，多语言）有现成 GGUF。云端替代：SiliconFlow key（siliconflow.cn 控制台申请） | 下节 / siliconflow.cn | 只能以 `deterministic` 冒烟（验证管线、无语义） |
 | 6 | 重排端点 | 同 #5：本地 llama.cpp 开第二个 server 进程；云端替代：SiliconFlow key（默认模型 `BAAI/bge-reranker-v2-m3`；云端方案可与 #5 共用同一把） | 同 #5 | 检索链路在精排步失败（见[排障](#排障)） |
 | 7 | 本插件本体 | 方式 A：本仓库构建出的 `lib/`；方式 B：本包目录经 `dsh plugin add` | 下两节 | — |
 
@@ -71,6 +71,8 @@ dsh plugin --profile web add /Path/To/dsh_mem
 ### 推荐：本地部署 llama.cpp 替代云端 API（嵌入 + 重排）
 
 嵌入与重排不必走云端：插件默认的两个模型——`BAAI/bge-m3`（嵌入，1024 维，中英多语言）与 `BAAI/bge-reranker-v2-m3`（重排）——都有现成 GGUF 量化版，可用 [llama.cpp](https://github.com/ggml-org/llama.cpp) 在本机跑成 HTTP 服务。**推荐理由：零 API key、零按量计费、记忆数据不出本机**；纯 CPU 即可胜任（有 NVIDIA GPU 时换 CUDA 构建，自动加速）。llama.cpp 没有 GUI（不像 Ollama / LM Studio 一键起服务），下面把安装、模型下载、启动、验证、接入写成可整段交给 Agent 逐步执行的步骤；坚持用云端 SiliconFlow 的跳过本节，直接走下一节的步骤（只需两把 key）。
+
+**先记住一件事：llama.cpp 与 dsh 宿主毫无关系**——`dsh web` 的启动流程既不会拉起也不会等待这两个 server；它们没在跑，插件的每轮检索与写入都会报 fetch failed。所以第 6 步会把启动固化成**脚本**：每次使用插件前先跑脚本、探活通过，再启动宿主；长期使用建议注册成开机自启。
 
 **第 1 步 · 安装 llama.cpp**（任选其一）：
 
@@ -155,7 +157,38 @@ curl http://127.0.0.1:8081/v1/rerank -H "Content-Type: application/json" \
 - 内部判分 LLM（`llm.provider` / `llm.model`）走宿主 ctx.llm 适配器（如 `deepseek-official`），与嵌入/重排端点无关，不用改；
 - 完成判据：重启 `npx @deepseek-ai/dsh web` 后聊天 UI 出现 `memory_search` 工具卡片，对模型说「记住：我的生产数据库是 PostgreSQL」后库文件增长（同下一节第 4 步的三项确认）。
 
-**第 6 步 · 常驻运行**（日常使用建议）：两个 server 是普通前台进程——长期使用各开一个终端挂着，或注册成系统自启（Windows「任务计划程序」、Linux systemd、macOS launchd）。宿主运行中 server 掉线不致命：期间检索与写入会报 fetch 错误，server 拉起后自动恢复，宿主无需重启。
+**第 6 步 · 写成启动脚本并常驻（重要）**：把第 3/4 步的两条命令固化成脚本——**每次使用插件前先跑它**。llama.cpp 与宿主无关，宿主不会替你拉起，忘了启动 = 每轮检索/写入报 fetch failed；交给 Agent 执行时更要明确交代这一步，脚本不在宿主启动链路里，Agent 不会自动想起它。
+
+Windows（存为 `start-llamacpp.ps1`，路径按实际改；跑一次拉起两个窗口）：
+
+```powershell
+$llama = 'llama-server'          # 解压安装写 llama-server.exe 的绝对路径
+$dir   = 'C:\path\to\models'     # 第 2 步两个 GGUF 所在目录
+
+Start-Process $llama "-m `"$dir\bge-m3-Q8_0.gguf`" --embeddings --pooling cls -c 8192 --port 8080"
+Start-Process $llama "-m `"$dir\bge-reranker-v2-m3-Q8_0.gguf`" --reranking --port 8081"
+```
+
+macOS / Linux（存为 `start-llamacpp.sh`，`chmod +x` 后运行；路径按实际改）：
+
+```sh
+#!/usr/bin/env sh
+LLAMA=llama-server          # 解压安装写绝对路径
+DIR=models                  # 第 2 步两个 GGUF 所在目录（相对运行目录）
+
+nohup "$LLAMA" -m "$DIR/bge-m3-Q8_0.gguf" --embeddings --pooling cls -c 8192 --port 8080 >llamacpp-embed.log 2>&1 &
+nohup "$LLAMA" -m "$DIR/bge-reranker-v2-m3-Q8_0.gguf" --reranking --port 8081 >llamacpp-rerank.log 2>&1 &
+```
+
+跑完用公开探活端点确认两个 server 就绪（`/health` 无需鉴权；`{"status":"ok"}` = 可用，`loading model` = 还在加载）：
+
+```sh
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8081/health
+```
+
+- 推荐顺序固定为：**跑启动脚本 → 探活通过 → `npx @deepseek-ai/dsh web`**；长期使用把脚本注册成系统自启（Windows「任务计划程序」、Linux systemd、macOS launchd），开机即就绪；
+- 宿主运行中 server 掉线不致命：期间检索与写入报 fetch 错误，重新跑脚本、探活通过后自动恢复，宿主无需重启。
 
 ### 从冒烟到可用：切换真实端点（可整段交给 Agent 逐步执行）
 
@@ -193,7 +226,7 @@ curl http://127.0.0.1:8081/v1/rerank -H "Content-Type: application/json" \
           model: deepseek-v4-flash
 ```
 
-`endpoint` / `model` / `dimensions` 不必写（出厂默认即 SiliconFlow `bge-m3`·1024 / `bge-reranker-v2-m3`）。走本地 llama.cpp 的不用这两把 key：把 `embedding` / `reranker` 两段换成「推荐：本地部署 llama.cpp」第 5 步的端点配置即可。完成判据：重启 `npx @deepseek-ai/dsh web` 后聊天 UI 出现 `memory_search` 工具卡片。
+`endpoint` / `model` / `dimensions` 不必写（出厂默认即 SiliconFlow `bge-m3`·1024 / `bge-reranker-v2-m3`）。走本地 llama.cpp 的不用这两把 key：把 `embedding` / `reranker` 两段换成「推荐：本地部署 llama.cpp」第 5 步的端点配置即可，并记得那两个 server 与宿主无关——**先跑该节第 6 步的启动脚本、探活通过，再起宿主**。完成判据：重启 `npx @deepseek-ai/dsh web` 后聊天 UI 出现 `memory_search` 工具卡片。
 
 **第 3 步 · 清理 deterministic 时代的旧库**（此前用 deterministic 跑过对话才需要）：旧记录的嵌入是词袋哈希，换真实嵌入后是噪声（换嵌入模型属不兼容变更，全景图 B-5）。**先停宿主进程**（防 SQLITE_BUSY），删除 `~/.dsh/storages/dsh_mem.sqlite`。没有免清理的迁移：把 `storage.version` 改成 `2` 只会让旧介质开库报 `version-mismatch`（那是强制清理的信号），最终仍要删库。
 
@@ -499,11 +532,12 @@ src/
 | 启动报 `storage backend '…' provides no kv facet` | profile 没有 storage 后端或 `storage.backend` 名不对：装 `dsh-storage-json`/`dsh-storage-sqlite` 并核对注册名 |
 | `dsh plugin add` 装 sqlite 后端被拒（incompatible / peer 闸） | 版本须与宿主**精确一致**（宿主 `dsh --version` 是 0.2.1-rc.2 就装 `@deepseek-ai/dsh-storage-sqlite@0.2.1-rc.2`）；报错信息里会给出 `allow-version` 豁免命令，但存储层不建议豁免版本差 |
 | sqlite 写入报 SQLITE_BUSY | 同一库文件被两个进程同时写（如 web GUI 与 headless --patch 并行）：后端无 busy-wait/重试，保持"一个 profile 一个进程" |
-| 插件停在 PENDING 不加载 | `inject` 的服务（storage/llm/tools/systemPrompt/sessions）缺提供方；查 `--dump-config` 与启动日志 |
+| 插件停在 PENDING 不加载 | `inject` 的服务（storage/llm/tools/systemPrompt/sessions/agents）缺提供方；查 `--dump-config` 与启动日志 |
+| 改配置热重载后某工作区持续报 `already-open`、记忆读写全失败 | 旧版本 HMR 卸载竞争 bug：旧实例残留在存量 agent 上的 `system-prompt/assemble` 监听器把刚关掉的 unit 又打开，新实例再开即被宿主拒（重载次数越多越容易触发）。已修复——卸载时显式摘除存量监听器、启动时补挂、ScopeRegistry 关闭后不再重开。升级后不会再触发；若升级前已处于损坏状态（unit 已被旧实例的 store 占住），重启宿主一次释放即恢复 |
 | 打开 unit 报 `version-mismatch` | `config.storage.version` 与介质上既有版本不一致；P1 仅向记录新增可选字段（旧记录缺字段按 undefined 容忍），保持 version=1 即可 |
 | 判分调用失败（NO_ADAPTER / 空回复 / error finish） | `llm.provider` 未注册适配器或凭据失效；llm.ts 会抛出携带失败码的错误，见 dsh 日志 |
 | 嵌入/重排 401、超时 | 核对 apiKey、endpoint、网络；临时可切 `deterministic` 模式隔离问题 |
-| 本地 llama.cpp 报 `fetch failed` / ECONNREFUSED | 对应端口的 server 没起来（嵌入 8080 / 重排 8081，按部署节第 3/4 步的 curl 自验）或端口写错；server 拉起后宿主自动恢复，无需重启 |
+| 本地 llama.cpp 报 `fetch failed` / ECONNREFUSED | 最常见原因：server 根本没启动——llama.cpp 与宿主无关，宿主不会拉起它。跑部署节第 6 步的启动脚本，再 `curl http://127.0.0.1:<端口>/health` 探活（`{"status":"ok"}` 才可用）；其次查端口写错。server 拉起后宿主自动恢复，无需重启 |
 | 本地 rerank 排名异常 / 分数全挤在一起 | llama.cpp 版本过旧的 rerank 已知缺陷，升级到最新 release；本插件会把越出 [0,1] 的原始 logit 自动 sigmoid 归一，正常无需干预 |
 | llama-server 启动即退出 / 嵌入质量异常 | 模式旗标用错：嵌入用 `--embeddings --pooling cls`，重排用 `--reranking`；并确认 GGUF 下载完整（中断会产生半个文件，重下） |
 | 睡眠周期从不触发 | `sleep.enabled` 为 false、新写入未达 `sleep.minNewMemories`、或聚类池小于 `clusterMinSize`；看启动后是否有 `sleep cycle:` 日志 |
