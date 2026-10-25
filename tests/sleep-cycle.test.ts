@@ -48,6 +48,7 @@ const BASE_CONFIG: Config = {
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
   emotion: { workspaces: [], alpha: 0.15, tauHours: 4, disclose: false },
   graph: { synonymCos: 0.8, maxDegree: 8 },
+  inspire: { counterProbability: 0.25 },
 }
 
 /** 覆写 sleep 段超参（其余段沿用 BASE_CONFIG）。 */

@@ -76,12 +76,17 @@ export interface ScoreEventOutcome<R> {
   readonly tierChanged: boolean
 }
 
-/** 使用事件（情景记录）：先补衰减再加增益，counters 全套更新，tier 随 S 跃迁。 */
+/**
+ * 使用事件（情景记录）：先补衰减再加增益，counters 全套更新，tier 随 S 跃迁。
+ * `inspired`（P3-4）：本次使用来自灵感通道——S 增益照常（效用闭环），另计
+ * inspired_count（wild-card 使用率 = inspired_count / used_count）。
+ */
 export function applyUseEvent(
   record: MemoryRecord,
   cue: number | undefined,
   now: number,
   config: Config,
+  inspired = false,
 ): ScoreEventOutcome<MemoryRecord> {
   const effectiveCue = cue ?? record.counters.last_cue_quality ?? 0
   const S =
@@ -96,6 +101,7 @@ export function applyUseEvent(
       counters: {
         ...record.counters,
         used_count: record.counters.used_count + 1,
+        ...(inspired ? { inspired_count: (record.counters.inspired_count ?? 0) + 1 } : {}),
         last_used_at: now,
         last_cue_quality: effectiveCue,
         last_decay_at: now,
@@ -130,12 +136,13 @@ export function applySuppressEvent(
   }
 }
 
-/** 使用事件（语义节点）：无 arousal 门、无 M5 重判，其余同记录侧。 */
+/** 使用事件（语义节点）：无 arousal 门、无 M5 重判，其余同记录侧（inspired 计数同款）。 */
 export function applyNodeUseEvent(
   node: SemanticNode,
   cue: number | undefined,
   now: number,
   config: Config,
+  inspired = false,
 ): SemanticNode {
   const counters = node.counters ?? zeroCounters()
   const effectiveCue = cue ?? counters.last_cue_quality ?? 0
@@ -148,6 +155,7 @@ export function applyNodeUseEvent(
     counters: {
       ...counters,
       used_count: counters.used_count + 1,
+      ...(inspired ? { inspired_count: (counters.inspired_count ?? 0) + 1 } : {}),
       last_used_at: now,
       last_cue_quality: effectiveCue,
       last_decay_at: now,
@@ -210,13 +218,15 @@ export class ScoreKeeper {
   /**
    * 检索结果记账（§2.1/§2.2）：top = 使用事件、suppressed = 抑制事件，
    * 情景层与语义层都消费；软失效/缺记录静默跳过（检索与记账之间可能被推翻）。
+   * `result.source === 'inspire'`（P3-4）时使用事件另计 inspired_count。
    * fire-and-forget 调用方保证失败不上抛。
    */
   async recordRetrieval(result: RetrievalResult): Promise<void> {
     const now = (this.deps.now ?? Date.now)()
+    const inspired = result.source === 'inspire'
     for (const winner of result.top) {
-      if (winner.item.layer === 'semantic') await this.useNode(winner, now)
-      else await this.useRecord(winner, now)
+      if (winner.item.layer === 'semantic') await this.useNode(winner, now, inspired)
+      else await this.useRecord(winner, now, inspired)
     }
     for (const loser of result.suppressed) {
       if (loser.item.layer === 'semantic') await this.suppressNode(loser, now)
@@ -224,12 +234,12 @@ export class ScoreKeeper {
     }
   }
 
-  private async useRecord(candidate: ScoredCandidate, now: number): Promise<void> {
+  private async useRecord(candidate: ScoredCandidate, now: number, inspired: boolean): Promise<void> {
     try {
       let tierChanged = false
       const updated = await this.deps.store.updateRecord(candidate.id, (record) => {
         if (record.time_meta.invalid_at !== undefined) return record // 已被推翻：不记账
-        const outcome = applyUseEvent(record, candidate.cue, now, this.deps.config)
+        const outcome = applyUseEvent(record, candidate.cue, now, this.deps.config, inspired)
         tierChanged = outcome.tierChanged
         return outcome.record
       })
@@ -254,11 +264,11 @@ export class ScoreKeeper {
     }
   }
 
-  private async useNode(candidate: ScoredCandidate, now: number): Promise<void> {
+  private async useNode(candidate: ScoredCandidate, now: number, inspired: boolean): Promise<void> {
     try {
       const node = this.deps.store.getNode(candidate.id)
       if (node === undefined || node.time_meta.invalid_at !== undefined) return
-      await this.deps.store.putNode(applyNodeUseEvent(node, candidate.cue, now, this.deps.config))
+      await this.deps.store.putNode(applyNodeUseEvent(node, candidate.cue, now, this.deps.config, inspired))
     } catch (err) {
       this.deps.log?.(`scoring: 节点使用事件记账失败（${candidate.id}）：${String(err)}`)
     }

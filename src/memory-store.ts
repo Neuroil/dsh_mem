@@ -15,6 +15,7 @@ import type { KvUnit, KvUnitDescriptor } from '@deepseek-ai/dsh-storage'
 import { UNIT_NAME_RE } from './config.js'
 import type { Config } from './config.js'
 import type {
+  InspireItem,
   MemoryRecord,
   MemoryTier,
   MoodState,
@@ -379,6 +380,36 @@ export class MemoryStore {
     for (const node of this.nodes.values()) {
       if (!validAt(node.time_meta, t)) continue
       items.push(this.toRetrievableNode(node))
+    }
+    return items
+  }
+
+  /**
+   * 灵感采样池（P3-4）：与检索宇宙同域（有效未压缩记录 + 有效语义节点），
+   * 投影额外携带采样偏置字段（usedCount/red/S/lastUsedAt；节点无 red 恒 0、
+   * counters 缺省按全 0 容忍）。memory_inspire 工具的消费视图。
+   */
+  inspirable(): readonly InspireItem[] {
+    const items: InspireItem[] = []
+    for (const record of this.records.values()) {
+      if (!isValidRecord(record) || isCompressed(record)) continue
+      items.push({
+        ...this.toRetrievableRecord(record),
+        usedCount: record.counters.used_count,
+        red: record.red,
+        S: record.S,
+        ...(record.counters.last_used_at !== undefined ? { lastUsedAt: record.counters.last_used_at } : {}),
+      })
+    }
+    for (const node of this.nodes.values()) {
+      if (!isValidNode(node)) continue
+      items.push({
+        ...this.toRetrievableNode(node),
+        usedCount: node.counters?.used_count ?? 0,
+        red: 0,
+        S: node.S,
+        ...(node.counters?.last_used_at !== undefined ? { lastUsedAt: node.counters.last_used_at } : {}),
+      })
     }
     return items
   }

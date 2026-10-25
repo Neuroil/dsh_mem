@@ -44,10 +44,11 @@ const BASE_CONFIG: Config = {
   score: { useGain: 0.5, suppressPenalty: 0.05, decayTauDays: 180, rejudgeEma: 0.5 },
   sleep: { enabled: true, minNewMemories: 10, clusterCos: 0.75, clusterMinSize: 3, qaPairCount: 3, qaF1Threshold: 0.8, epiThreshold: 0.5, conWindow: 1000, conAttachSigma: 0.5, conNewNodeSigma: -1, conNewNodeMinImp: 7, attachGain: 0.5 },
   section: { enabled: true, maxMemories: 5, header: 'memories:' },
-  tool: { enabled: true, maxResults: 5 },
+  tool: { enabled: true, maxResults: 5, clear: false },
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
   emotion: { workspaces: [], alpha: 0.15, tauHours: 4, disclose: false },
   graph: { synonymCos: 0.8, maxDegree: 8 },
+  inspire: { counterProbability: 0.25 },
 }
 
 function makeRecord(over: Partial<MemoryRecord> = {}): MemoryRecord {
@@ -364,5 +365,57 @@ describe('ScoreKeeper.recordRetrieval（两通道共用的记账入口）', () =
     expect(store.records.get('dead')!.counters.used_count).toBe(0)
     // ghost/nobody：情景层经 updateRecord 抛错吞掉、语义层 getNode undefined 直接返回
     expect(logs.length).toBe(1)
+  })
+})
+
+describe('inspired 记账（P3-4 灵感通道效用闭环）', () => {
+  it('applyUseEvent inspired=true：S 增益照常、used_count 与 inspired_count 同计', () => {
+    const record = makeRecord({ S: 5, arousal: 0 })
+    const { record: next } = applyUseEvent(record, 0.6, 1_000, BASE_CONFIG, true)
+    expect(next.S).toBeCloseTo(5.4, 12) // 与普通使用逐位一致
+    expect(next.counters.used_count).toBe(1)
+    expect(next.counters.inspired_count).toBe(1)
+  })
+
+  it('applyUseEvent 缺省 inspired=false：不产生 inspired_count 键（旧形状零扰动）', () => {
+    const { record: next } = applyUseEvent(makeRecord(), 0.6, 1_000, BASE_CONFIG)
+    expect(next.counters.used_count).toBe(1)
+    expect(next.counters).not.toHaveProperty('inspired_count')
+  })
+
+  it('applyNodeUseEvent inspired=true：节点侧同规（缺省 counters 容忍）', () => {
+    const node = makeNode({ S: 4 })
+    const next = applyNodeUseEvent(node, 0.2, 1_000, BASE_CONFIG, true)
+    expect(next.S).toBeCloseTo(4 + 0.5 * 1.2, 12)
+    expect(next.counters?.used_count).toBe(1)
+    expect(next.counters?.inspired_count).toBe(1)
+  })
+
+  it('recordRetrieval source: inspire：top 双层都计 inspired_count；suppressed 不受影响', async () => {
+    const store = new FakeStore()
+    store.records.set('m1', makeRecord({ id: 'm1', S: 5 }))
+    store.nodes.set('n1', makeNode({ id: 'n1', S: 4 }))
+    const keeper = new ScoreKeeper({ llm: new FakeLlm(), store, config: BASE_CONFIG, now: () => 1_000 })
+
+    await keeper.recordRetrieval({
+      ...makeRetrieval([makeCandidate('m1', 'episodic'), makeCandidate('n1', 'semantic')]),
+      source: 'inspire',
+    })
+
+    expect(store.records.get('m1')!.counters.used_count).toBe(1)
+    expect(store.records.get('m1')!.counters.inspired_count).toBe(1)
+    expect(store.nodes.get('n1')!.counters?.used_count).toBe(1)
+    expect(store.nodes.get('n1')!.counters?.inspired_count).toBe(1)
+  })
+
+  it('recordRetrieval 无 source（memory_search 通道）：inspired_count 恒缺省', async () => {
+    const store = new FakeStore()
+    store.records.set('m1', makeRecord({ id: 'm1', S: 5 }))
+    const keeper = new ScoreKeeper({ llm: new FakeLlm(), store, config: BASE_CONFIG, now: () => 1_000 })
+
+    await keeper.recordRetrieval(makeRetrieval([makeCandidate('m1', 'episodic')]))
+
+    expect(store.records.get('m1')!.counters.used_count).toBe(1)
+    expect(store.records.get('m1')!.counters).not.toHaveProperty('inspired_count')
   })
 })

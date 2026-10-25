@@ -168,6 +168,16 @@ export interface GraphConfig {
   maxDegree: number
 }
 
+/** 灵感通道（P3-4，设计 §10.1）：随机探索采样参数（memory_inspire 工具）。 */
+export interface InspireConfig {
+  /**
+   * counter 情绪对冲的切换概率（仅情绪白名单工作区 + mood:'counter' 参数时生效）：
+   * 每次抽样以该概率换用「valence 与当前 mood 相反的高 S」分布——与 wild-card
+   * 同机制换分布，避免陪伴对象在低落情绪里被同类记忆持续加固。
+   */
+  counterProbability: number
+}
+
 export interface StorageConfig {
   /** Backend name registered on ctx.storage (`json` / `sqlite`). */
   backend: string
@@ -198,6 +208,7 @@ export interface Config {
   intake: IntakeConfig
   emotion: EmotionConfig
   graph: GraphConfig
+  inspire: InspireConfig
 }
 
 const httpModel = (defaults: { endpoint: string; model: string; timeoutMs: number }) =>
@@ -382,4 +393,9 @@ export const Config: Schema<Config> = Schema.object({
     synonymCos: Schema.percent().default(0.8),
     maxDegree: Schema.natural().min(1).default(8),
   }).default({ synonymCos: 0.8, maxDegree: 8 }),
+
+  // 灵感通道（P3-4）：见 InspireConfig 注释
+  inspire: Schema.object({
+    counterProbability: Schema.percent().default(0.25),
+  }).default({ counterProbability: 0.25 }),
 })

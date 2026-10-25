@@ -43,7 +43,7 @@ import { ScopeRegistry, scopeKeyOfAgent, scopeKeyOfSession, unitNameFor } from '
 import type { Config } from './config.js'
 import type { MoodState, RetrievalResult } from './types.js'
 import { WritePipeline } from './write-path.js'
-import { createMemoryClearTool, createMemorySearchTool, formatMemories } from './tool.js'
+import { createMemoryClearTool, createMemoryInspireTool, createMemorySearchTool, formatMemories } from './tool.js'
 
 /** Extract visible text from a message's content blocks. */
 export function messageText(message: Message): string {
@@ -151,6 +151,27 @@ export class MemoryRuntime {
           }
         },
         recentTurns: (agent) => this.recentTurnsFor(agent),
+        config: this.config,
+      }))
+
+      // 灵感通道（P3-4）：随机探索采样，仅情绪白名单（陪伴）工作区放行，
+      // agent 工作区调用返回规范拒绝值——助手场景零影响
+      this.ctx.tools.register(createMemoryInspireTool({
+        resolve: async (agent) => {
+          const cwd = agent?.session?.header?.cwd
+          const scopeKey = scopeKeyOfAgent(agent, this.config)
+          const rt = await this.scopedFor(scopeKey)
+          const emotionEnabled = isEmotionEnabled(cwd, this.config)
+          const mood = emotionEnabled ? rt.store.getMood() : null
+          return {
+            scopeKey,
+            inspirable: rt.store.inspirable(),
+            emotionEnabled,
+            mood: mood !== null ? decayMood(mood, Date.now(), this.config.emotion.tauHours) : null,
+            recordInspiration: (result: RetrievalResult) => void rt.scores.recordRetrieval(result),
+          }
+        },
+        embedding: this.embedding,
         config: this.config,
       }))
     }

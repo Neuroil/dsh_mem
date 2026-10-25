@@ -5,11 +5,10 @@
  */
 import { describe, expect, it, vi } from 'vitest'
 import type { ToolExecution } from '@deepseek-ai/dsh-tools'
-import { createMemoryClearTool, createMemorySearchTool, formatMemories, parseAt } from '../src/tool.js'
+import { createMemoryClearTool, createMemoryInspireTool, createMemorySearchTool, formatMemories, parseAt } from '../src/tool.js'
 import type { MemoryRetriever } from '../src/retrieval.js'
-import type { MoodState } from '../src/types.js'
+import type { InspireItem, MoodState, RetrievalResult } from '../src/types.js'
 import type { Config } from '../src/config.js'
-import type { RetrievalResult } from '../src/types.js'
 
 const config: Config = {
   storage: { backend: 'json', unit: 'dsh_mem', version: 1, workspaceScope: false },
@@ -26,6 +25,7 @@ const config: Config = {
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
   emotion: { workspaces: [], alpha: 0.15, tauHours: 4, disclose: false },
   graph: { synonymCos: 0.8, maxDegree: 8 },
+  inspire: { counterProbability: 0.25 },
 }
 
 /** 检索器替身：记录调用参数并回放固定结果。 */
@@ -218,5 +218,170 @@ describe('memory_search 情绪透传（P3-1）', () => {
     await tool.execute({ query: 'q' }, exec)
 
     expect((retrieve.mock.calls[0]![1] as Record<string, unknown>)['mood']).toBeUndefined()
+  })
+})
+
+describe('memory_inspire.execute（P3-4 灵感通道）', () => {
+  const execInspire = { callId: 'c3', name: 'memory_inspire', arguments: {} } as unknown as ToolExecution
+  const now = () => new Date(2026, 10, 25, 12, 0, 0)
+
+  function makeInspireItem(id: string, overrides: Partial<InspireItem> = {}): InspireItem {
+    return {
+      id,
+      text: `memory ${id}`,
+      embedding: [1, 0],
+      r_m: 0,
+      tier: 'warm',
+      createdAt: 0,
+      layer: 'episodic',
+      usedCount: 0,
+      red: 0,
+      S: 5,
+      ...overrides,
+    }
+  }
+
+  function makeEmbedding() {
+    return {
+      dimensions: 2,
+      embed: vi.fn(async (texts: readonly string[]) => texts.map(() => [1, 0] as const)),
+    }
+  }
+
+  function makeInspireDeps(scope: {
+    scopeKey?: string
+    inspirable?: readonly InspireItem[]
+    emotionEnabled?: boolean
+    mood?: MoodState | null
+  } = {}) {
+    const recordInspiration = vi.fn()
+    const embedding = makeEmbedding()
+    const deps = {
+      resolve: async () => ({
+        scopeKey: 'scope-a',
+        inspirable: [makeInspireItem('a'), makeInspireItem('b'), makeInspireItem('c')],
+        emotionEnabled: true,
+        mood: null,
+        recordInspiration,
+        ...scope,
+      }),
+      embedding,
+      config,
+      now,
+    }
+    return { deps, recordInspiration, embedding }
+  }
+
+  it('agent（非白名单）工作区：规范拒绝值，不入账、不嵌入', async () => {
+    const { deps, recordInspiration, embedding } = makeInspireDeps({ emotionEnabled: false, inspirable: [] })
+    const tool = createMemoryInspireTool(deps)
+
+    const output = await tool.execute({}, execInspire) as Record<string, unknown>
+
+    expect(String(output['error'])).toContain('companion workspaces')
+    expect(output['memories']).toEqual([])
+    expect(recordInspiration).not.toHaveBeenCalled()
+    expect(embedding.embed).not.toHaveBeenCalled()
+  })
+
+  it('空池：规范拒绝值，不入账', async () => {
+    const { deps, recordInspiration } = makeInspireDeps({ inspirable: [] })
+    const tool = createMemoryInspireTool(deps)
+
+    const output = await tool.execute({}, execInspire) as Record<string, unknown>
+
+    expect(String(output['error'])).toContain('no memories')
+    expect(recordInspiration).not.toHaveBeenCalled()
+  })
+
+  it('白名单工作区：采样去重上限、inspired 恒 true、记账携带 source: inspire', async () => {
+    const { deps, recordInspiration } = makeInspireDeps({
+      inspirable: Array.from({ length: 8 }, (_, i) => makeInspireItem(`m${i}`)),
+    })
+    const tool = createMemoryInspireTool(deps)
+
+    const output = await tool.execute({}, execInspire) as { memories: Array<{ id: string; inspired: boolean; usedCount: number }>; error?: string }
+
+    expect(output.error).toBeUndefined()
+    expect(output.memories).toHaveLength(config.tool.maxResults)
+    expect(new Set(output.memories.map((m) => m.id)).size).toBe(config.tool.maxResults)
+    expect(output.memories.every((m) => m.inspired === true)).toBe(true)
+    expect(recordInspiration).toHaveBeenCalledTimes(1)
+    const result = recordInspiration.mock.calls[0]![0] as RetrievalResult
+    expect(result.source).toBe('inspire')
+    expect(result.top.map((c) => c.id)).toEqual(output.memories.map((m) => m.id))
+  })
+
+  it('无 topic：不调用嵌入（纯随机臂），score 恒 0', async () => {
+    const { deps, embedding } = makeInspireDeps()
+    const tool = createMemoryInspireTool(deps)
+
+    const output = await tool.execute({}, execInspire) as { memories: Array<{ score: number }> }
+
+    expect(embedding.embed).not.toHaveBeenCalled()
+    expect(output.memories.every((m) => m.score === 0)).toBe(true)
+  })
+
+  it('topic：嵌入恰好一次、score 为 topic 余弦、记账 query = topic', async () => {
+    const { deps, embedding, recordInspiration } = makeInspireDeps()
+    const tool = createMemoryInspireTool(deps)
+
+    const output = await tool.execute({ topic: 'cats' }, execInspire) as { memories: Array<{ score: number }> }
+
+    expect(embedding.embed).toHaveBeenCalledTimes(1)
+    // 嵌入替身恒 [1,0]，与池内 item.embedding 同向 → 余弦 1
+    expect(output.memories.every((m) => m.score === 1)).toBe(true)
+    const result = recordInspiration.mock.calls[0]![0] as RetrievalResult
+    expect(result.query).toBe('cats')
+  })
+
+  it('同日确定性：固定 now 下两次调用输出逐位一致', async () => {
+    const { deps } = makeInspireDeps({ inspirable: Array.from({ length: 8 }, (_, i) => makeInspireItem(`m${i}`)) })
+    const tool = createMemoryInspireTool(deps)
+
+    const first = await tool.execute({}, execInspire) as never
+    const second = await tool.execute({}, execInspire) as never
+
+    expect(second).toEqual(first)
+  })
+
+  it('mood: counter 且 mood 存在时不抛异常（对冲臂激活路径）', async () => {
+    const { deps, recordInspiration } = makeInspireDeps({
+      mood: { valence: -0.6, arousal: 0.5, updated_at: 0 },
+      inspirable: [
+        makeInspireItem('pos', { valence: 0.9 }),
+        makeInspireItem('neg', { valence: -0.9 }),
+        makeInspireItem('mid'),
+      ],
+    })
+    const tool = createMemoryInspireTool(deps)
+
+    const output = await tool.execute({ mood: 'counter' }, execInspire) as Record<string, unknown>
+
+    expect(output).not.toHaveProperty('error')
+    expect(recordInspiration).toHaveBeenCalledTimes(1)
+  })
+
+  it('mood: counter 但 mood 为 null：静默回退常规臂（确定性输出与不传参一致）', async () => {
+    const pool = [makeInspireItem('pos', { valence: 0.9 }), makeInspireItem('neg', { valence: -0.9 })]
+    const plain = makeInspireDeps({ inspirable: pool })
+    const countered = makeInspireDeps({ inspirable: pool, mood: null })
+
+    const a = await createMemoryInspireTool(plain.deps).execute({}, execInspire) as { memories: Array<{ id: string }> }
+    const b = await createMemoryInspireTool(countered.deps).execute({ mood: 'counter' }, execInspire) as { memories: Array<{ id: string }> }
+
+    expect(b.memories.map((m) => m.id)).toEqual(a.memories.map((m) => m.id))
+  })
+
+  it('render：拒绝值渲染 refused 文本；成功值渲染灵感列表', async () => {
+    const refused = makeInspireDeps({ emotionEnabled: false })
+    const refusedTool = createMemoryInspireTool(refused.deps)
+    const refusedOutput = await refusedTool.execute({}, execInspire) as never
+    expect(String(((refusedTool.output.render({}, refusedOutput))[0] as { text: string }).text)).toContain('memory_inspire refused')
+
+    const ok = makeInspireDeps()
+    const okTool = createMemoryInspireTool(ok.deps)
+    const okOutput = await okTool.execute({}, execInspire) as never
+    expect(String(((okTool.output.render({}, okOutput))[0] as { text: string }).text)).toContain('Long-dormant memories')
   })
 })

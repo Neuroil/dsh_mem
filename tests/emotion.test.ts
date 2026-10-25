@@ -25,9 +25,11 @@ const config = (workspaces: string[]): Config => ({
   score: { useGain: 0.5, suppressPenalty: 0.05, decayTauDays: 180, rejudgeEma: 0.5 },
   sleep: { enabled: true, minNewMemories: 10, clusterCos: 0.75, clusterMinSize: 3, qaPairCount: 3, qaF1Threshold: 0.8, epiThreshold: 0.5, conWindow: 1000, conAttachSigma: 0.5, conNewNodeSigma: -1, conNewNodeMinImp: 7, attachGain: 0.5 },
   section: { enabled: true, maxMemories: 5, header: 'memories:' },
-  tool: { enabled: true, maxResults: 5 },
+  tool: { enabled: true, maxResults: 5, clear: false },
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
   emotion: { workspaces, alpha: 0.15, tauHours: 4, disclose: false },
+  graph: { synonymCos: 0.8, maxDegree: 8 },
+  inspire: { counterProbability: 0.25 },
 })
 
 const HOUR = 3_600_000

@@ -247,7 +247,7 @@ curl http://127.0.0.1:8081/health
 - 启动日志：`[dsh-mem] started: backend=…, workspaceScope=…, clearTool=…`；首个会话事件后：`scope opened: unit=… (N valid memories)`；
 - 每轮 `turn/end` 后（有写入时）：`turn N: wrote X, superseded Y, dropped Z`；
 - 睡眠周期触发后：`sleep cycle: C clusters (M migrated, G gated), refreshed R records / N nodes, decayed R'/N'`；
-- 聊天 UI 出现 `memory_search` 工具卡片（开启 `tool.clear` 后另有 `memory_clear` 卡片）；库非空且命中时，`memory_search` 结果与自动记忆 section 出现在上下文（语义节点带 `gist` 标记）；
+- 聊天 UI 出现 `memory_search` 工具卡片（陪伴白名单工作区另有 `memory_inspire` 卡片；开启 `tool.clear` 后另有 `memory_clear` 卡片）；库非空且命中时，`memory_search` 结果与自动记忆 section 出现在上下文（语义节点带 `gist` 标记）；
 - storage 介质上出现 unit：json 后端每 unit 一个 `~/.dsh/storages/<unit>.json`；sqlite 后端全部 unit 在同一 `<path>.sqlite` 内（表名 `u_<unit>_episodic` / `u_<unit>_semantic`）。
 
 ## 产出结果
@@ -297,6 +297,28 @@ Relevant long-term memories (semantic retrieval; recency was not a factor):
 { "episodic": 3, "semantic": 2, "total": 5 }
 ```
 
+### 2b. `memory_inspire` 工具（P3-4 灵感通道，仅陪伴工作区）
+
+随机探索通道（设计 §10.1）：带种子的图上随机游走翻出**久未使用但语义相连**的记忆，供陪伴对话制造"还记得吗"的惊喜时刻。**不是检索**——无相关性排序，不替代 `memory_search`。
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `topic` | string，可选 | 弱锚点：采样偏向与该话题相关者（余弦线性放大权重、不硬过滤）；省略则纯随机 |
+| `mood` | 'counter'，可选 | 情绪对冲：以 `inspire.counterProbability` 概率切换到「valence 与当前心境相反的高 S」分布（用户低落时偏向翻出积极记忆）；当前无 mood 时静默忽略 |
+
+- **确定性节奏**：seed = 工作区 ⊕ 本地日期 ⊕ topic——同一天同话题返回同样的灵感，跨天自然换一批（无任何定时器）。
+- **仅 `emotion.workspaces` 白名单工作区可用**（陪伴场景特性）；agent 工作区调用返回规范 error 值引导用 `memory_search`，零行为影响。
+- **效用闭环**：翻出的记忆照常计入 S 使用增益并另计 `inspired_count`（wild-card 使用率 = inspired_count / used_count）——被用过的灵感沉回正常排序、下一个冷门者顶上；该使用率是将来是否纳入自动注入的决策依据（当前仅模型主动调用）。
+
+```json
+{
+  "memories": [
+    { "id": "41b7de…", "text": "深夜调试时一起去楼下便利店买了关东煮", "layer": "episodic", "tier": "cold",
+      "usedCount": 0, "score": 0, "inspired": true }
+  ]
+}
+```
+
 ### 3. 持久记忆库（经宿主 ctx.storage 持久化，介质由存储后端决定）
 
 本包**不自带数据库/存储引擎**，也不直接读写文件：一切持久化经宿主的存储系统 `ctx.storage`（接口由 `@deepseek-ai/dsh-storage` 定义）。插件代码只见 KV unit 抽象——`storage.backend.get(name).kv.open(descriptor)` 打开一个 unit（描述符：两张逻辑表、无全局槽、带格式版本），之后以 `putRecord` / `loadAll` / `close` 读写；实际介质与落盘位置由 profile 里安装的**存储后端**决定（json 后端 = 每 unit 一个 JSON 文件；sqlite 后端 = 一个真实 SQLite 库文件）。
@@ -304,7 +326,7 @@ Relevant long-term memories (semantic retrieval; recency was not a factor):
 - **按工作区隔离（M2）**：记忆库的 scope = 会话创建时的工作目录（`session.header.cwd`，宿主验证过的绝对路径）。每个工作区一个 KV unit（`<unit>_ws_<8位哈希>`，路径归一化后 FNV-1a），写入/检索/睡眠/计分全套按作用域独立——**物理隔离，跨工作区不可能串库**。无 cwd 的会话（如部分 headless 场景）回退到 `config.storage.unit` 本名；`storage.workspaceScope: false` 可恢复全局单库旧行为。
 - **存储后端（M1）**：后端是宿主侧独立安装的插件包，本包不含任何后端。生产推荐 `sqlite`（`dsh-storage-sqlite`，一个库文件承载全部 unit，消灭 json 后端 pretty-print 的体积膨胀；安装需与宿主版本精确对齐，见[前置条件](#前置条件)）；json 后端（dsh-base 自带）保留为回退与测试用途。
 - KV unit（前缀默认 `dsh_mem`，`config.storage.unit` 可改；unit 名只允许小写字母/数字/下划线，**不允许连字符**——宿主规则 `/^[a-z][a-z0-9_]*$/`），两张逻辑表：`episodic`（MemoryRecord）与 `semantic`（SemanticNode，睡眠周期填充）——json 后端下是文件里的两个键，sqlite 后端下是两张 key/value 表 `u_<unit>_episodic` / `u_<unit>_semantic`（见[确认插件在跑](#确认插件在跑)）。
-- 记录含 M5 判分（imp/valence/arousal/reasons）、邻域统计（r_m/red）、巩固分数 S、分层 tier（hot/warm/cold）、使用计数（used_count/suppressed_count/last_used_at/last_cue_quality/last_decay_at）——计数自 P2 起被 S 动态消费；语义节点带同构的可选 counters。
+- 记录含 M5 判分（imp/valence/arousal/reasons）、邻域统计（r_m/red）、巩固分数 S、分层 tier（hot/warm/cold）、使用计数（used_count/suppressed_count/last_used_at/last_cue_quality/last_decay_at；P3-4 起灵感使用另计 inspired_count）——计数自 P2 起被 S 动态消费；语义节点带同构的可选 counters。
 - **软失效**：被取代的记录或语义节点只设 `invalid_at` / `superseded_by` 并移出检索索引，永不删除。矛盾判定带**时间重叠闸**（§2.5 完整版）：只对同一时间框架的矛盾软失效，"过去用 MySQL"与"现在用 PostgreSQL"这类不同时期的矛盾两条都保留。
 - **压缩归档**（P1）：被语义节点吸收的记录设 `flags.compressed_into` / `qa_passed` 与 `time_meta.compressed_at`（归档时点，时间旅行消费）并退出检索池；QA/epi 闸门拒收的簇标 `flags.incompressible`，全簇已标时需新成员加入才重试。
 - 落盘位置由所选 storage 后端拥有（json / sqlite 各自决定介质），unit 格式版本见 `config.storage.version`。
@@ -355,7 +377,7 @@ turn/end 信号门控触发（自上次周期新写入 ≥ `sleep.minNewMemories
 |---|---|
 | `src/` | 插件源码（模块地图见[开发](#开发)） |
 | `lib/` | `npm run build` 产物（ESM + .d.ts） |
-| `tests/` | 257 个离线单测（vitest，无需网络与 API key） |
+| `tests/` | 285 个离线单测（vitest，无需网络与 API key） |
 | `scripts/eval-ndcg.mjs` | §7.1 检索四档消融脚手架 |
 | `scripts/eval-sleep.mjs` | P1 睡眠周期脚手架（QA 保留率、压缩后召回存续） |
 | `scripts/eval-semtime.mjs` | P2 语义 vs 时间消融脚手架（§7.4 关键消融 + 时间旅行） |
@@ -369,7 +391,7 @@ turn/end 信号门控触发（自上次周期新写入 ≥ `sleep.minNewMemories
 | 门禁 | 结果 |
 |---|---|
 | `npm run typecheck`（strict + noUncheckedIndexedAccess） | 0 错误 |
-| `npm test` | 211/211 通过 |
+| `npm test` | 285/285 通过 |
 | `npm run build` → `lib/` | 通过；`node` 导入 `lib/index.js` 与 Config 默认值校验通过 |
 | 非法配置响亮失败 | Schema 加载时抛 `ValidationError`（如 `score.useGain: "not-a-number"`） |
 | sqlite 后端探针（M1） | headless one-shot 实测：后端注册 → kv.open → putRecord/loadAll 往返（嵌套 JSON 完好） |
@@ -495,7 +517,7 @@ PPR 联想（pprWeight=0.2）: recall@5 = 100.0%，命中均值排名 = 2.0，�
 ```sh
 npm install
 npm run typecheck                          # tsc --noEmit
-npm test                                   # vitest run（全部 257 个）
+npm test                                   # vitest run（全部 285 个）
 npx vitest run tests/sleep-cycle.test.ts   # 单文件
 npm run build                              # 产出 lib/
 ```
@@ -515,6 +537,7 @@ src/
   retrieval.ts    四级检索管线 + 消融档（base/csls/rerank/full；L0 池 = 未压缩记录 + 语义节点；at 时间旅行；mood/PPR 排序加成）
   graph.ts        语义图边工具（P3-2：去重/度数上限/密度统计）+ 邻接构建与 PPR 幂迭代（P3-3）
   emotion.ts      情绪编码（P3-1：白名单判定、moodSim/衰减/EMA 融合、disclose 文案）
+  inspire.ts      灵感通道（P3-4：mulberry32 种子化 PRNG + 图上带偏随机游走采样，冷门/高 red/topic 弱锚定 + counter 情绪对冲两臂）
   embedding.ts    嵌入/重排客户端（OpenAI 兼容 /embeddings、/rerank；deterministic 离线替身）
   llm.ts          内部 LLM 调用（ctx.llm 流服务 + BlockAssembler；适配器失败按终态 error/aborted 块识别）
   judges.ts       候选抽取 / M5 判分 / 矛盾判定（含 temporal 重叠）/ epi 词法 / gist 抽取 / QA 生成与作答 / M4 兼容复核（JSON 健壮解析 + 重试一次）
@@ -522,7 +545,7 @@ src/
   write-path.ts   写入管线（§5.1 七步 + §2.5 完整版：时间重叠闸 + 语义节点软失效；单候选失败不中断整轮）
   sleep-cycle.ts  睡眠巩固周期（§2.3 七步 + 第 7 步 S 兜底衰减；迁移带 compressed_at 归档时点 + 同簇建边）
   runtime.ts      编排：会话观察、agent 定域自动注入、ScoreKeeper 记账接线、睡眠周期触发
-  tool.ts         memory_search 工具（含 at 时间旅行参数）+ memory_clear（开发/测试硬删除，默认关）+ section 文本渲染
+  tool.ts         memory_search 工具（含 at 时间旅行参数）+ memory_inspire（P3-4 灵感通道，仅陪伴工作区）+ memory_clear（开发/测试硬删除，默认关）+ section 文本渲染
 ```
 
 实现选择说明：自动注入落在 `system-prompt/assemble` waterfall（agent 定域注册）而非 `ctx.systemPrompt.section()`——后者 text provider 是同步签名，承载不了异步检索链路；前者为官方文档同章节列出的扩展点。检索查询取自 `agent/inbox/claimed` 的待处理输入 ⊕ 最近对话尾部。
@@ -548,7 +571,8 @@ src/
 | `sleep.epiThreshold`(0.5) | gist 的 M6 epi 迁移阈值（低于才迁语义层） |
 | `sleep.conWindow`(1000) / `conAttachSigma`(0.5) / `conNewNodeSigma`(−1) / `conNewNodeMinImp`(7) / `attachGain`(0.5) | M4 路由：z 基线窗口与三档路由阈值、挂入增益 |
 | `section.enabled` / `maxMemories`(5) / `header` | 自动注入通道 |
-| `tool.enabled` / `maxResults`(5) / `clear`(false) | memory_search 工具；`clear` 开启 `memory_clear`（按工作区硬删除全部长期记忆的开发/测试工具，唯一违反「永不删除」的操作，仅供测试迭代） |
+| `tool.enabled` / `maxResults`(5) / `clear`(false) | memory_search 与 memory_inspire 工具；`clear` 开启 `memory_clear`（按工作区硬删除全部长期记忆的开发/测试工具，唯一违反「永不删除」的操作，仅供测试迭代） |
+| `inspire.counterProbability`(0.25) | 灵感通道 counter 情绪对冲臂的切换概率（P3-4，仅 `emotion.workspaces` 白名单工作区 + `mood:'counter'` 参数时生效） |
 
 ## 排障
 
@@ -570,6 +594,7 @@ src/
 | 压缩后检索不到原细节 | 设计行为：成员内容由节点 gist 承载（§2.3"记住要点、忘掉细节"）；回溯经 `flags.compressed_into` 索引原记录，或用 `memory_search` 的 `at` 参数在归档前的时点检索 |
 | 记忆还在但排不上名 | tier 可能已沉到 cold（S 动态：长期未使用 + 兜底衰减）：cold 项需 CSLS cue ≥ `cueThreshold + coldCueBoost` 才保留；调 `tier.coldThreshold` / `score.decayTauDays`，或等使用事件把它推回 warm |
 | `memory_search` 返回 `invalid 'at'` | `at` 需为 ISO 8601（以 4 位年份开头）或正整数 epoch ms；领域级错误写进规范值，不影响工具通道 |
+| `memory_inspire` 返回 `inspiration channel is only available in companion workspaces` | 设计行为：灵感通道仅 `emotion.workspaces` 白名单工作区可用（陪伴场景特性），agent 工作区恒拒绝——把该工作区路径加进白名单，或改用 `memory_search` |
 | 情绪重排不生效 / mood 不更新 | 工作区不在 `emotion.workspaces` 白名单（默认空 = 全部 bypass）；核对路径写法（大小写/分隔符不敏感但须精确匹配，非前缀）；mood τ=4h 衰减，隔日归零属正常；消融脚本 `npm run eval:emotion` 可离线验证 |
 | 聊天 UI 没有 `memory_clear` 工具卡片 | 默认关闭（破坏性工具）：config 加 `tool: { clear: true }`（HMR 即生效），启动日志 `clearTool=true` 旁证；它只清**当前工作区**的库，换嵌入模型/版本迁移等全清场景仍以删介质文件为准 |
 

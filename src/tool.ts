@@ -5,9 +5,19 @@
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { MemoryRetriever, RetrieveOptions } from './retrieval.js'
 import type { Config } from './config.js'
-import type { MemoryTier, MoodState, RetrievalResult, ScoredCandidate } from './types.js'
+import { cosine } from './metrics.js'
+import { inspireSeed, localDateKey, mulberry32, sampleInspirations } from './inspire.js'
+import type { RetrieveOptions } from './retrieval.js'
+import type { MemoryRetriever } from './retrieval.js'
+import type {
+  EmbeddingProvider,
+  InspireItem,
+  MemoryTier,
+  MoodState,
+  RetrievalResult,
+  ScoredCandidate,
+} from './types.js'
 
 /** 按 agent 解析出的作用域内检索依赖（M2：检索与计分必须落在同一 scope）。 */
 export interface MemoryScopeDeps {
@@ -200,6 +210,200 @@ export function createMemorySearchTool(deps: MemorySearchDeps) {  const maxResul
         memories: result.top.map(toHit),
         suppressedCount: result.suppressed.length,
         ...(at !== undefined ? { at } : {}),
+      }
+      return output
+    },
+  })
+}
+
+// ---- memory_inspire（P3-4 灵感通道） ----
+
+/** 按 agent 解析出的灵感通道作用域依赖。 */
+export interface MemoryInspireScope {
+  /** 作用域键（seed 分量：不同工作区灵感流不同）。 */
+  readonly scopeKey: string | undefined
+  /** 灵感采样池（store.inspirable()：检索宇宙 + usedCount/red/S）。 */
+  readonly inspirable: readonly InspireItem[]
+  /** 工作区是否在情绪白名单内（false = agent 工作区，工具返回规范拒绝值）。 */
+  readonly emotionEnabled: boolean
+  /** 惰性衰减后的当前 mood（白名单工作区且已有时出现；counter 对冲消费）。 */
+  readonly mood: MoodState | null
+  /** 灵感使用记账（S 增益照常 + inspired_count，效用闭环的入账点）。 */
+  readonly recordInspiration: (result: RetrievalResult) => void
+}
+
+export interface MemoryInspireDeps {
+  readonly resolve: (agent: Agent | undefined) => Promise<MemoryInspireScope>
+  /** topic 弱锚定的嵌入提供方（仅 topic 非空时调用一次）。 */
+  readonly embedding: EmbeddingProvider
+  readonly config: Config
+  /** 日期分量注入点（测试可固定；缺省取本地当下）。 */
+  readonly now?: () => Date
+}
+
+interface InspireHit {
+  id: string
+  text: string
+  layer: 'episodic' | 'semantic'
+  tier: MemoryTier
+  /** 历史使用次数（0 = 从未激活）。 */
+  usedCount: number
+  lastUsedAt?: number
+  /** topic 余弦（无 topic 时 0）。 */
+  score: number
+  /** 来源标记恒 true：灵感通道输出（区别于 memory_search 的语义检索）。 */
+  inspired: true
+}
+
+interface InspireOutput {
+  memories: InspireHit[]
+  /** 领域性拒绝（agent 工作区 / 空库）写入规范值而非抛异常（工具契约）。 */
+  error?: string
+}
+
+/**
+ * The `memory_inspire` tool — the serendipity channel (P3-4, design §10.1):
+ * a seeded random walk over the memory graph surfaces long-dormant but
+ * semantically connected memories. Deterministic per (workspace, day, topic):
+ * the same topic on the same day returns the same memories; drift across days
+ * provides natural spacing. **Companion workspaces only** (emotion.workspaces
+ * whitelist) — agent workspaces get a canonical error value, never samples.
+ * Not part of automatic injection until wild-card usage data justifies it.
+ */
+export function createMemoryInspireTool(deps: MemoryInspireDeps) {
+  return defineTool({
+    name: 'memory_inspire',
+    description:
+      'Serendipitous recall for companion conversations: surfaces long-unused but ' +
+      'semantically connected memories via a seeded random walk over the memory graph ' +
+      '(biased toward rarely-used, well-connected ones). Deterministic per day and topic — ' +
+      'the same topic within a day returns the same memories. Only available in companion ' +
+      'workspaces; not a substitute for memory_search (no relevance ranking).',
+    parameters: {
+      topic: {
+        type: 'string',
+        description:
+          'Optional weak anchor: biases sampling toward memories related to this topic ' +
+          '(omit for pure serendipity).',
+      },
+      mood: {
+        type: 'string',
+        enum: ['counter'],
+        description:
+          "Pass 'counter' to hedge the current mood: with some probability, sampling shifts " +
+          'toward high-consolidation memories of opposite emotional valence (e.g. uplifting ' +
+          'memories when the user is down).',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          memories: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string', required: true },
+                text: { type: 'string', required: true },
+                layer: { type: 'string', enum: ['episodic', 'semantic'], required: true },
+                tier: { type: 'string', enum: ['hot', 'warm', 'cold'], required: true },
+                usedCount: { type: 'integer', required: true },
+                lastUsedAt: { type: 'integer' },
+                score: { type: 'number', required: true },
+                // 恒 true（灵感通道输出的来源标记）；不用 const 键——输出 schema
+                // 未验证过 const 支持（F-11 教训：注册期校验失败会杀掉整个插件）
+                inspired: { type: 'boolean', required: true },
+              },
+            },
+          },
+          error: { type: 'string' },
+        },
+      },
+      render: (_args, value: InspireOutput) => [
+        {
+          type: 'text',
+          text: value.error !== undefined
+            ? `memory_inspire refused: ${value.error}`
+            : value.memories.length === 0
+              ? 'No memories to draw inspiration from yet.'
+              : 'Long-dormant memories that might be worth revisiting:\n' +
+                value.memories
+                  .map((m, i) => `${i + 1}. ${m.text} [id=${m.id} used ${m.usedCount}×${m.lastUsedAt !== undefined ? `, last used ${new Date(m.lastUsedAt).toISOString().slice(0, 10)}` : ', never used'}${m.layer === 'semantic' ? ' gist' : ''}]`)
+                  .join('\n'),
+        },
+      ],
+    },
+    presentCall: (args) => ({
+      card: 'generic',
+      title: `memory_inspire${args.topic !== undefined ? `: ${args.topic}` : ''}`,
+      kind: 'search',
+    }),
+    presentResult: () => ({
+      card: 'generic',
+      title: 'memory_inspire',
+    }),
+    async execute(args, exec) {
+      const scope = await deps.resolve(exec.agent)
+      // agent（非白名单）工作区拒绝：灵感通道是陪伴场景特性，agent 助手零影响
+      if (!scope.emotionEnabled) {
+        const refused: InspireOutput = {
+          memories: [],
+          error: 'inspiration channel is only available in companion workspaces (emotion.workspaces); use memory_search instead',
+        }
+        return refused
+      }
+      if (scope.inspirable.length === 0) {
+        const empty: InspireOutput = { memories: [], error: 'no memories in this workspace yet' }
+        return empty
+      }
+      const topic = typeof args.topic === 'string' && args.topic.trim() !== '' ? args.topic.trim() : undefined
+      let topicVector: readonly number[] | undefined
+      if (topic !== undefined) {
+        const embedded = await deps.embedding.embed([topic], exec.signal)
+        topicVector = embedded[0]
+      }
+      // seed = fnv1a(scope ⊕ 本地日期 ⊕ topic)：同日同话题可复现、跨日漂移
+      const now = deps.now?.() ?? new Date()
+      const seed = inspireSeed(scope.scopeKey, localDateKey(now), topic ?? '')
+      const counterMood =
+        args.mood === 'counter' && scope.mood !== null && scope.mood.valence !== 0
+          ? { valence: scope.mood.valence, probability: deps.config.inspire.counterProbability }
+          : undefined
+      const picked = sampleInspirations(scope.inspirable, {
+        count: deps.config.tool.maxResults,
+        rng: mulberry32(seed),
+        ...(topicVector !== undefined ? { topicVector } : {}),
+        ...(counterMood !== undefined ? { counterMood } : {}),
+      })
+      // 效用闭环：灵感使用照常入账（S 增益 + inspired_count），被使用的记忆
+      // 沉回正常 top-K、下一个冷门者顶上——S 动态自动充当灵感质量裁判
+      scope.recordInspiration({
+        query: topic ?? '',
+        expandedQuery: topic ?? '',
+        stages: { l0: [], csls: [], rerank: [], mmr: [] },
+        top: picked.map((item) => ({
+          id: item.id,
+          cos: topicVector !== undefined ? cosine(topicVector, item.embedding) : 0,
+          item,
+        })),
+        suppressed: [],
+        source: 'inspire',
+      })
+      const output: InspireOutput = {
+        memories: picked.map((item) => ({
+          id: item.id,
+          text: item.text,
+          layer: item.layer,
+          tier: item.tier,
+          usedCount: item.usedCount,
+          ...(item.lastUsedAt !== undefined ? { lastUsedAt: item.lastUsedAt } : {}),
+          score: topicVector !== undefined ? cosine(topicVector, item.embedding) : 0,
+          inspired: true,
+        })),
       }
       return output
     },

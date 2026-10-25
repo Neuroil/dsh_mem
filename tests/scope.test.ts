@@ -29,6 +29,7 @@ const config = (workspaceScope: boolean): Config => ({
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
   emotion: { workspaces: [], alpha: 0.15, tauHours: 4, disclose: false },
   graph: { synonymCos: 0.8, maxDegree: 8 },
+  inspire: { counterProbability: 0.25 },
 })
 
 describe('normalizeWorkspacePath / workspaceScopeHash', () => {

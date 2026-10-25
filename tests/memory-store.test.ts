@@ -26,6 +26,7 @@ const testConfig = (): Config => ({
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
   emotion: { workspaces: [], alpha: 0.15, tauHours: 4, disclose: false },
   graph: { synonymCos: 0.8, maxDegree: 8 },
+  inspire: { counterProbability: 0.25 },
 })
 
 /** 全字段 MemoryRecord（对照 types.ts；r_m/red/epi 为 0，con_route pending，counters 全 0）。 */
@@ -491,6 +492,30 @@ describe('MemoryStore 语义层节点（P1 睡眠周期填充）', () => {
     expect(raw).toMatchObject({ id: 'r1', text: 'raw memory', layer: 'episodic', tier: 'warm', createdAt: 1000, r_m: 0 })
     expect(node).toMatchObject({ id: 'n1', text: 'distilled gist', layer: 'semantic', tier: 'hot', r_m: 0.3, createdAt: 1000 })
     expect(node?.embedding).toEqual([0.6, 0.8])
+    await store.close()
+  })
+
+  it('inspirable()：与检索宇宙同域 + 采样偏置字段投影（P3-4）；节点 red 恒 0、counters 缺省容忍', async () => {
+    const { open } = await makeEnv()
+    const { store } = await open()
+    await store.putRecord(makeRecord({
+      id: 'r1', embedding: [1, 0], red: 1.5, S: 6,
+      counters: { used_count: 3, suppressed_count: 0, last_used_at: 4321 },
+      links: [{ kind: 'related', target: 'n1' }],
+    }))
+    await store.putRecord(makeRecord({ id: 'r2', embedding: [0, 1], flags: { compressed_into: 'n1' } }))
+    await store.putRecord(makeRecord({ id: 'dead', embedding: [0, 1], time_meta: { created_at: 1, valid_at: 1, invalid_at: 9 } }))
+    await store.putNode(makeNode('n1', [0.6, 0.8], { S: 9 }))
+    await store.putNode(makeNode('n2', [0, 1], { time_meta: { created_at: 1, valid_at: 1, invalid_at: 5 } }))
+
+    const items = store.inspirable()
+    expect(items.map((i) => i.id)).toEqual(['r1', 'n1']) // 压缩/软失效退出，同 retrievable 域
+    const [raw, node] = items
+    expect(raw).toMatchObject({
+      id: 'r1', layer: 'episodic', usedCount: 3, red: 1.5, S: 6, lastUsedAt: 4321, neighbors: ['n1'],
+    })
+    expect(node).toMatchObject({ id: 'n1', layer: 'semantic', usedCount: 0, red: 0, S: 9 })
+    expect(node && 'lastUsedAt' in node).toBe(false) // 无 counters → 无 lastUsedAt
     await store.close()
   })
 

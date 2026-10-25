@@ -61,6 +61,11 @@ export interface ScoreCounters {
   last_cue_quality?: number
   /** 上次兜底衰减锚点（§2.1）；缺省以 time_meta.created_at 为锚（旧记录容忍）。 */
   last_decay_at?: number
+  /**
+   * 经灵感通道（memory_inspire，P3-4）产生的使用次数——wild-card 使用率 =
+   * inspired_count / used_count，灵感效用的量化指标（旧记录缺省按 0 容忍）。
+   */
+  inspired_count?: number
 }
 
 /**
@@ -218,6 +223,27 @@ export interface RetrievalResult {
   readonly top: readonly ScoredCandidate[]
   /** Candidates that competed and lost in the final selection (weak-form suppression, §2.2). */
   readonly suppressed: readonly ScoredCandidate[]
+  /**
+   * 检索来源标记（P3-4）：缺省视为常规检索（memory_search / 自动注入）；
+   * `'inspire'` = 灵感通道采样结果——使用事件照常增益 S（效用闭环），但
+   * counters.inspired_count 单独累加（wild-card 使用率可量化）。
+   */
+  readonly source?: 'inspire'
+}
+
+/**
+ * 灵感采样池项（P3-4，设计 §10.1）：检索宇宙（RetrievableItem 全字段）+
+ * 采样偏置所需的记账/判分侧字段。MemoryStore.inspirable() 的投影形状。
+ */
+export interface InspireItem extends RetrievableItem {
+  /** 使用次数（低 used_count = 冷门，采样正向偏置）。 */
+  readonly usedCount: number
+  /** 冗余度（高 red = 语义网络中心，采样正向偏置）；语义节点无 red，恒 0。 */
+  readonly red: number
+  /** 巩固分数（counter 对冲臂偏向高 S）。 */
+  readonly S: number
+  /** 上次使用时点（缺省 = 从未使用）；输出侧"久未激活"框架消费。 */
+  readonly lastUsedAt?: number
 }
 
 /**
