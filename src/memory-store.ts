@@ -3,7 +3,9 @@
  *
  * 一切持久化经宿主 KvUnit（ctx.storage.backend.get(name).kv.open(descriptor)），
  * 不自建数据库或裸文件：表 = episodic（MemoryRecord，§4.1）+ semantic
- * （SemanticNode，§4.2），键 = 记录 id，无 global 槽。
+ * （SemanticNode，§4.2），键 = 记录 id；global 槽存作用域级 MoodState
+ * （P3，单值非记忆——sqlite/json 后端对既有 unit 翻 hasGlobal 均为纯增量，
+ * 不触碰 version 戳，已对照 dsh-storage-sqlite 源码确认）。
  *
  * 写入顺序统一为「先持久化、后改内存镜像」：KvUnit 的单次调用在 resolve 时
  * 即已原子且持久（崩溃后重开可观察到该写），因此镜像只在持久化成功后更新，
@@ -15,6 +17,7 @@ import type { Config } from './config.js'
 import type {
   MemoryRecord,
   MemoryTier,
+  MoodState,
   Neighbor,
   RetrievableItem,
   SemanticNode,
@@ -22,11 +25,12 @@ import type {
 } from './types.js'
 
 /**
- * KV unit 描述符：表 = episodic（MemoryRecord）+ semantic（SemanticNode），无 global 槽（§5.0）。
- * unit 名由调用方传入（M2：工作区 unit 名由 scope.ts 派生，回退用 config.storage.unit），
- * 在此归一化并本地校验：连字符归一为下划线（宿主不允许连字符），归一后仍不满足
- * UNIT_NAME_RE 的名字在此抛错——让不合规命名在启动期暴露，而不是等宿主
- * validateDescriptor 抛 malformed-medium 后被 apply() 的 catch 吞掉。
+ * KV unit 描述符：表 = episodic（MemoryRecord）+ semantic（SemanticNode），
+ * global 槽 = MoodState（P3）。unit 名由调用方传入（M2：工作区 unit 名由
+ * scope.ts 派生，回退用 config.storage.unit），在此归一化并本地校验：连字符
+ * 归一为下划线（宿主不允许连字符），归一后仍不满足 UNIT_NAME_RE 的名字在此
+ * 抛错——让不合规命名在启动期暴露，而不是等宿主 validateDescriptor 抛
+ * malformed-medium 后被 apply() 的 catch 吞掉。
  */
 export function memoryUnitDescriptor(unitName: string, config: Config): KvUnitDescriptor {
   const name = unitName.replace(/-/g, '_')
@@ -38,7 +42,7 @@ export function memoryUnitDescriptor(unitName: string, config: Config): KvUnitDe
     name,
     version: config.storage.version,
     tables: ['episodic', 'semantic'],
-    hasGlobal: false,
+    hasGlobal: true,
   }
 }
 
@@ -111,6 +115,15 @@ function asSemanticNode(raw: unknown): SemanticNode | undefined {
   return raw as SemanticNode
 }
 
+/** global 槽的最小形状校验（P3 MoodState）：三字段均为有限数值；不合规视为无状态并 warn。 */
+function asMoodState(raw: unknown): MoodState | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const v = raw as Record<string, unknown>
+  if (typeof v.valence !== 'number' || typeof v.arousal !== 'number' || typeof v.updated_at !== 'number') return undefined
+  if (!Number.isFinite(v.valence) || !Number.isFinite(v.arousal) || !Number.isFinite(v.updated_at)) return undefined
+  return raw as MoodState
+}
+
 /** 余弦均值；空集返回 0（无近邻时 r_m = 0）。适用于任何带 cos 字段的命中项。 */
 function meanCos(items: readonly { cos: number }[]): number {
   if (items.length === 0) return 0
@@ -132,6 +145,8 @@ function meanCos(items: readonly { cos: number }[]): number {
  */
 export class MemoryStore {
   private closed = false
+  /** 作用域 mood 状态的内存镜像（global 槽；null = 从未写入或槽内数据不合规）。 */
+  private mood: MoodState | null
 
   private constructor(
     private readonly unit: KvUnit,
@@ -139,12 +154,16 @@ export class MemoryStore {
     private readonly config: Config,
     private readonly records: Map<string, MemoryRecord>,
     private readonly nodes: Map<string, SemanticNode>,
-  ) {}
+    mood: MoodState | null,
+  ) {
+    this.mood = mood
+  }
 
   /**
    * 从已打开的 KvUnit 加载快照并重建索引（open KvUnit 本身是调用方的事：
    * 插件入口经 ctx.storage.backend.get(name).kv.open(descriptor) 打开后传入）。
-   * 不合规记录逐条跳过并 console.warn 一次，不抛错。
+   * 不合规记录逐条跳过并 console.warn 一次，不抛错；global 槽不合规同样
+   * 降级为 null（mood 丢失可再聚合，不值得拒绝开库）。
    */
   static async open(unit: KvUnit, index: VectorIndex, config: Config): Promise<MemoryStore> {
     const snapshot = await unit.loadAll()
@@ -175,7 +194,27 @@ export class MemoryStore {
     for (const node of nodes.values()) {
       if (isValidNode(node)) index.add(node.id, node.embedding)
     }
-    return new MemoryStore(unit, index, config, records, nodes)
+    const mood = asMoodState(snapshot.global)
+    if (snapshot.global != null && mood === undefined) {
+      console.warn('[dsh-mem] global 槽中的 mood 状态不合规，按无状态处理')
+    }
+    return new MemoryStore(unit, index, config, records, nodes, mood ?? null)
+  }
+
+  /** 读取作用域 mood 状态（内存镜像；null = 无）。 */
+  getMood(): MoodState | null {
+    return this.mood
+  }
+
+  /**
+   * 写入作用域 mood 状态：先持久化（global 槽单值 upsert）后改内存镜像（INV-4）。
+   * mood 不是记忆：不进任何索引/检索视图，`clearAll()` 也不清除它（τ 衰减
+   * 自然消解；被清记忆后残留半小时情绪是自然的陪伴行为）。
+   */
+  async setMood(mood: MoodState): Promise<void> {
+    this.assertOpen()
+    await this.unit.setGlobal(mood)
+    this.mood = mood
   }
 
   /** 关闭 unit；幂等。关闭后任何写方法抛 Error('closed')。 */

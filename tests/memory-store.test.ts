@@ -62,6 +62,8 @@ const makeNode = (id: string, embedding: readonly number[], overrides: Partial<S
 /** 共享介质：多个 FakeKvUnit 先后打开同一 backing，模拟"持久化后重开"。 */
 class FakeBacking {
   readonly tables = new Map<string, Map<string, unknown>>()
+  /** global 槽（P3 MoodState）：单值，与真实后端一致地在 loadAll 全量返回。 */
+  global: unknown = null
   constructor(readonly descriptor: KvUnitDescriptor) {
     for (const table of descriptor.tables) this.tables.set(table, new Map())
   }
@@ -85,7 +87,7 @@ class FakeKvUnit implements KvUnit {
     for (const [name, table] of this.backing.tables) {
       tables[name] = Object.fromEntries([...table.entries()].map(([k, v]) => [k, JSON.parse(JSON.stringify(v))]))
     }
-    return { tables, global: null }
+    return { tables, global: this.backing.global === null ? null : JSON.parse(JSON.stringify(this.backing.global)) }
   }
   async putRecord(table: string, key: string, value: unknown): Promise<void> {
     this.assertOpen()
@@ -98,7 +100,7 @@ class FakeKvUnit implements KvUnit {
   async setGlobal(value: unknown): Promise<void> {
     this.assertOpen()
     if (!this.backing.descriptor.hasGlobal) throw new Error('unit declares no global slot')
-    this.backing.global = value
+    this.backing.global = value === null ? null : JSON.parse(JSON.stringify(value)) // 与表同款 JSON 往返语义
   }
   async close(): Promise<void> {
     this.closed = true
@@ -158,13 +160,13 @@ const open = async () => (await makeEnv()).open()
 // ---------------------------------------------------------------- 用例
 
 describe('memoryUnitDescriptor', () => {
-  it('形状：表名 episodic+semantic，name 来自入参、version 来自 config，无 global 槽', () => {
+  it('形状：表名 episodic+semantic，name 来自入参、version 来自 config，global 槽承载 MoodState', () => {
     const config = testConfig()
     expect(memoryUnitDescriptor(config.storage.unit, config)).toEqual({
       name: 'dsh_mem_test',
       version: 7,
       tables: ['episodic', 'semantic'],
-      hasGlobal: false,
+      hasGlobal: true,
     })
   })
 
@@ -184,6 +186,63 @@ describe('memoryUnitDescriptor', () => {
   it('归一化后仍不合规的 unit 名在启动期抛错', () => {
     const config = testConfig()
     expect(() => memoryUnitDescriptor('1bad Unit', config)).toThrow(/invalid storage unit name/)
+  })
+})
+
+describe('MoodState（global 槽，P3）', () => {
+  it('空槽 open → getMood() 为 null', async () => {
+    const { store } = await open()
+    expect(store.getMood()).toBeNull()
+    await store.close()
+  })
+
+  it('setMood → 重开（同一 backing）读回相等（先持久化后镜像）', async () => {
+    const { backing, open: openStore } = await makeEnv()
+    {
+      const { store } = await openStore()
+      await store.setMood({ valence: -0.4, arousal: 0.7, updated_at: 1234 })
+      expect(store.getMood()).toEqual({ valence: -0.4, arousal: 0.7, updated_at: 1234 })
+      await store.close()
+    }
+    const { store: store2 } = await openStore()
+    expect(store2.getMood()).toEqual({ valence: -0.4, arousal: 0.7, updated_at: 1234 })
+    await store2.close()
+    expect(backing.global).toEqual({ valence: -0.4, arousal: 0.7, updated_at: 1234 })
+  })
+
+  it('槽内数据不合规（字段缺失/非数值）→ open 降级为 null 并 warn，不抛错', async () => {
+    const { backing, open: openStore } = await makeEnv()
+    backing.global = { valence: 'sad', arousal: 0.5 } // 缺 updated_at 且 valence 非 number
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const { store } = await openStore()
+    expect(store.getMood()).toBeNull()
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('mood'))
+    warn.mockRestore()
+    await store.close()
+  })
+
+  it('setMood 可整体覆盖（单值 upsert 语义）', async () => {
+    const { store } = await open()
+    await store.setMood({ valence: 0.2, arousal: 0.1, updated_at: 1 })
+    await store.setMood({ valence: -0.1, arousal: 0.3, updated_at: 2 })
+    expect(store.getMood()).toEqual({ valence: -0.1, arousal: 0.3, updated_at: 2 })
+    await store.close()
+  })
+
+  it('close 后 setMood 抛 Error(\'closed\')', async () => {
+    const { store } = await open()
+    await store.close()
+    await expect(store.setMood({ valence: 0, arousal: 0, updated_at: 1 })).rejects.toThrow('closed')
+  })
+
+  it('clearAll() 不清除 mood（设计决策：mood 非记忆，τ 衰减自然消解）', async () => {
+    const { store } = await open()
+    await store.putRecord(makeRecord({ id: 'a', embedding: [1, 0] }))
+    await store.setMood({ valence: 0.5, arousal: 0.5, updated_at: 9 })
+    const counts = await store.clearAll()
+    expect(counts.episodic).toBe(1)
+    expect(store.getMood()).toEqual({ valence: 0.5, arousal: 0.5, updated_at: 9 })
+    await store.close()
   })
 })
 

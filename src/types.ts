@@ -58,6 +58,17 @@ export interface ScoreCounters {
   last_decay_at?: number
 }
 
+/**
+ * 作用域级 mood 状态（P3 情绪编码）：从写入路径的 turn 级情绪聚合（EMA），
+ * 读取时按 τ 惰性衰减（INV-7 同架构），持久化于 unit 的 global 槽（单值，
+ * 不是记忆——不参与检索宇宙，`memory_clear` 也不清除它）。
+ */
+export interface MoodState {
+  valence: number
+  arousal: number
+  updated_at: number
+}
+
 /** Where this memory came from (session log provenance, for audit only). */
 export interface MemoryOrigin {
   readonly session_id: string
