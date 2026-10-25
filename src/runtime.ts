@@ -16,7 +16,10 @@
  * undefined = storage.unit 本名）一个 ScopedRuntime——自己的 store / 检索 /
  * 写入 / 睡眠 / 计分，惰性开启（ScopeRegistry 缓存 open Promise），卸载时
  * 统一关闭。写入按会话 scope 路由，注入与工具按 agent 会话 scope 路由；
- * 单个 scope 开启失败只影响该 scope 的那次事件，不拖垮其他工作区。
+ * 单个 scope 开启失败只影响该 scope 的那次事件，不拖垮其他工作区。HMR
+ * 重载的卸载契约：unit 经 closeAll 统一关闭，agent 上的 assemble 监听器
+ * 显式摘除、启动时对存量 agent 补挂——旧实例不得再碰 unit（否则新实例撞
+ * already-open），新实例不得漏挂存量 agent。
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -314,15 +317,19 @@ export class MemoryRuntime {
       const text = messageText(message)
       if (text) this.pendingQuery.set(String(agent.id), text)
     })
-    this.ctx.on('agent/disposed', ({ agent }: { agent: Agent }) => {
-      this.pendingQuery.delete(String(agent.id))
-    })
 
-    // 0.2.x 起 agent/created 为 serial 事件：监听器需返回 undefined | Promise<undefined>（awaited）
-    this.ctx.on('agent/created', async ({ agent }: { agent: Agent }) => {
-      // Agent-scoped registration: contributions unwind with the agent
-      // (architecture doc: scope registrations to one agent via agent.ctx).
-      agent.ctx.on('system-prompt/assemble', async (assembly, context, next) => {
+    // assemble 监听器必须定域在 agent.ctx（scope 过滤分发的契约），但 agent.ctx
+    // 上的 effect 只随 agent 卸载、不随插件卸载：HMR 重载后旧实例的监听器仍
+    // 活着，会经已 closeAll 的 ScopeRegistry 把刚关掉的 unit 重新打开，新实例
+    // 再开即撞宿主 already-open 保护。因此显式登记每个 disposer：agent 死亡
+    // 时清登记，插件卸载时全部摘除（本 effect 注册晚于 closeAll effect，fiber
+    // 逆序反注册保证先摘监听器、后关 unit）。
+    const assembleDisposers = new Map<string, () => void>()
+    let unwinding = false
+    const attachAssemble = (agent: Agent): void => {
+      const id = String(agent.id)
+      if (unwinding || assembleDisposers.has(id)) return
+      const off = agent.ctx.on('system-prompt/assemble', async (assembly, context, next) => {
         const downstream = await next()
         try {
           const text = await this.renderAutoSection(agent, context.signal)
@@ -332,6 +339,28 @@ export class MemoryRuntime {
         }
         return downstream
       })
+      assembleDisposers.set(id, off)
+    }
+
+    this.ctx.on('agent/disposed', ({ agent }: { agent: Agent }) => {
+      this.pendingQuery.delete(String(agent.id))
+      // agent 卸载已连带移除其监听器，这里只清登记防止 map 无界增长
+      assembleDisposers.delete(String(agent.id))
+    })
+
+    // 0.2.x 起 agent/created 为 serial 事件：监听器需返回 undefined | Promise<undefined>（awaited）
+    this.ctx.on('agent/created', ({ agent }: { agent: Agent }): undefined => {
+      attachAssemble(agent)
+      return undefined
+    })
+    // 重载（HMR）后已存活的 agent 不会再收到 agent/created：启动时对存量
+    // agent 补挂，重载后自动注入才不中断。
+    for (const agent of this.ctx.agents.list()) attachAssemble(agent)
+
+    this.ctx.effect(() => () => {
+      unwinding = true
+      for (const off of assembleDisposers.values()) off()
+      assembleDisposers.clear()
     })
   }
 

@@ -20,7 +20,7 @@ export type { ConfigType }
 
 export const name = 'dsh-mem'
 
-export const inject = ['storage', 'llm', 'tools', 'systemPrompt', 'sessions']
+export const inject = ['storage', 'llm', 'tools', 'systemPrompt', 'sessions', 'agents']
 
 export function apply(ctx: Context, config: ConfigType): void {
   const logger = ctx.logger('dsh-mem')

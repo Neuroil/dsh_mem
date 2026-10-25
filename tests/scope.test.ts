@@ -162,6 +162,36 @@ describe('ScopeRegistry', () => {
     expect(close).toHaveBeenCalledTimes(3)
   })
 
+  it('closeAll 后 get 一律拒绝：迟到事件绝不重开 unit（HMR 卸载防线）', async () => {
+    const open = vi.fn(async (key: string | undefined) => ({ key }))
+    const close = vi.fn()
+    const registry = new ScopeRegistry({ open, close })
+
+    await registry.get('ab12cd34')
+    const closing = registry.closeAll()
+    // closeAll 同步进入终态：进行中的 closeAll 期间与完成后的 get 都拒绝
+    await expect(registry.get('ef567890')).rejects.toThrow(/closed/)
+    await closing
+    await expect(registry.get('ab12cd34')).rejects.toThrow(/closed/)
+    await expect(registry.get(undefined)).rejects.toThrow(/closed/)
+    expect(open).toHaveBeenCalledTimes(1)
+    expect(close).toHaveBeenCalledTimes(1)
+  })
+
+  it('closeAll 等待在途 open 完成后再关闭（卸载不泄漏刚开的 unit）', async () => {
+    let resolveOpen: ((v: { key: string | undefined }) => void) | undefined
+    const open = vi.fn(() => new Promise<{ key: string | undefined }>((r) => { resolveOpen = r }))
+    const close = vi.fn()
+    const registry = new ScopeRegistry({ open, close })
+
+    const pending = registry.get('ab12cd34')
+    const closing = registry.closeAll()
+    resolveOpen?.({ key: 'ab12cd34' })
+    await pending
+    await closing
+    expect(close).toHaveBeenCalledTimes(1)
+  })
+
   it('双工作区路由：两个不同 cwd 的会话进入不同 unit（物理隔离的装配前提）', async () => {
     const openedNames: Array<string | undefined> = []
     const open = vi.fn(async (key: string | undefined) => {

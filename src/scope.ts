@@ -73,7 +73,9 @@ export interface ScopeRegistryOptions<T> {
 /**
  * 作用域注册表：scope 键 → 惰性单例（缓存 Promise，并发 get 共享同一次
  * open）；open 失败不缓存（下次事件重试）；closeAll 统一关闭（含在途 open
- * 完成后关闭），并清空缓存使注册表可复用。
+ * 完成后关闭）。closeAll 后注册表进入**终态**：get 一律拒绝、绝不重开——
+ * 已卸载实例的迟到事件若重开刚关掉的 unit，会让新实例撞宿主 already-open
+ * 保护（HMR 重载竞争），该工作区直到重启宿主都不可用。
  */
 export class ScopeRegistry<T> {
   private readonly entries = new Map<string, Promise<T>>()
@@ -87,6 +89,11 @@ export class ScopeRegistry<T> {
   }
 
   get(scopeKey: string | undefined): Promise<T> {
+    if (this.closed) {
+      return Promise.reject(
+        new Error('scope registry closed (plugin unloaded); refusing to reopen units'),
+      )
+    }
     const key = this.cacheKey(scopeKey)
     let entry = this.entries.get(key)
     if (entry === undefined) {
