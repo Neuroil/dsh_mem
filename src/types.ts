@@ -27,6 +27,9 @@ export interface RetrievableItem {
   readonly tier: MemoryTier
   readonly createdAt: number
   readonly layer: 'episodic' | 'semantic'
+  /** M5 情绪判分（仅情景记录；语义节点已去情境化，恒 undefined）。P3-1 情绪重排消费。 */
+  readonly valence?: number
+  readonly arousal?: number
 }
 
 /** M5 structured rubric verdict for one memory (§3.5). */
@@ -184,6 +187,11 @@ export interface ScoredCandidate {
   readonly cos: number
   /** CSLS-corrected cue distinctiveness, present from the CSLS stage on. */
   readonly cue?: number
+  /**
+   * 情绪相似度（P3-1，仅情绪白名单工作区且候选项带情绪判分时出现）：
+   * 排序键为 cue + α·moodSim；**cold 门控仍用纯 cue**（侧门封死）。
+   */
+  readonly moodSim?: number
   /** Cross-encoder relevance in [0,1], present from the rerank stage on. */
   readonly relevance?: number
   /** Episodic record or semantic node this candidate resolves to. */

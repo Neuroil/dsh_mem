@@ -45,6 +45,8 @@ function makeItem(init: {
   tier?: MemoryTier
   createdAt?: number
   layer?: 'episodic' | 'semantic'
+  valence?: number
+  arousal?: number
 }): RetrievableItem {
   return {
     id: init.id,
@@ -54,6 +56,8 @@ function makeItem(init: {
     tier: init.tier ?? 'warm',
     createdAt: init.createdAt ?? 0,
     layer: init.layer ?? 'episodic',
+    ...(init.valence !== undefined ? { valence: init.valence } : {}),
+    ...(init.arousal !== undefined ? { arousal: init.arousal } : {}),
   }
 }
 
@@ -487,4 +491,76 @@ describe('MemoryRetriever 时间旅行（§2.5 完整版，P2）', () => {
     const result = await retriever.retrieve(QUERY, { at: 1 })
     expect(ids(result.stages.l0)).toEqual(['current'])
   })
+})
+
+// ---------- P3-1 情绪重排 ----------
+
+describe('CSLS 情绪重排（P3-1：只进排序键，不进召回与 cold 门控）', () => {
+  const mood = { valence: -0.6, arousal: 0.8, updated_at: 0 }
+
+  function itemsWithAffect(): RetrievableItem[] {
+    return [
+      // A：与 mood 完全契合（moodSim=1）；B：情绪相远（moodSim=0.05）但 cos 略高
+      makeItem({ id: 'a-emo', text: 'aligned', embedding: normalize([1, 0.05]), r_m: 0.1, valence: -0.6, arousal: 0.8 }),
+      makeItem({ id: 'b-emo', text: 'distant', embedding: normalize([1, 0.0]), r_m: 0.1, valence: 0.6, arousal: 0.1 }),
+    ]
+  }
+
+  it('mood 传入时排序键 = cue + α·moodSim：情绪契合者可反超 cos 略高者', async () => {
+    const items = itemsWithAffect()
+    const { provider } = makeEmbedding({ q: [1, 0] })
+    const lookup: MemoryLookup = { retrievable: () => items }
+    const retriever = new MemoryRetriever({ embedding: provider, reranker: zeroReranker(), lookup, config: makeConfig() })
+
+    const plain = await retriever.retrieve('q', { ablation: 'csls' })
+    const withMood = await retriever.retrieve('q', { ablation: 'csls', mood: { state: mood, alpha: 0.2 } })
+
+    // 纯 cue 序：B 在前（cos 更高）；情绪序：A 反超（0.2·(1−0.05)=0.19 > cue 差）
+    expect(ids(plain.stages.csls)[0]).toBe('b-emo')
+    expect(ids(withMood.stages.csls)[0]).toBe('a-emo')
+    // moodSim 记录在候选上；cue 保持纯值（无情绪版本的同名候选 cue 相等）
+    const aPlain = plain.stages.csls.find(c => c.id === 'a-emo')
+    const aMood = withMood.stages.csls.find(c => c.id === 'a-emo')
+    expect(aMood?.moodSim).toBe(1)
+    expect(aMood?.cue).toBeCloseTo(aPlain?.cue ?? Number.NaN, 10)
+  })
+
+  it('cold 门控用纯 cue：情绪契合不得把 cold 项抬过门槛', async () => {
+    const items = [
+      makeItem({ id: 'cold-emo', text: 'cold aligned', embedding: normalize([1, 0.05]), r_m: 0.1, tier: 'cold', valence: -0.6, arousal: 0.8 }),
+      makeItem({ id: 'warm-plain', text: 'warm', embedding: normalize([1, 0.0]), r_m: 0.1 }),
+    ]
+    const { provider } = makeEmbedding({ q: [1, 0] })
+    const lookup: MemoryLookup = { retrievable: () => items }
+    // coldFloor 抬到纯 cue 永远过不了的高度：cold 项即使 moodSim=1 也必须被滤掉
+    const retriever = new MemoryRetriever({ embedding: provider, reranker: zeroReranker(), lookup, config: makeConfig({ cueThreshold: 10 }) })
+    const out = await retriever.retrieve('q', { ablation: 'csls', mood: { state: mood, alpha: 0.2 } })
+    expect(ids(out.stages.csls)).toEqual(['warm-plain'])
+  })
+
+  it('无 valence/arousal 的候选（语义节点/旧记录）排序键 = 纯 cue', async () => {
+    const items = [
+      makeItem({ id: 'node', text: 'gist', embedding: normalize([1, 0.05]), r_m: 0.1, layer: 'semantic' }),
+      makeItem({ id: 'rec', text: 'record', embedding: normalize([1, 0.0]), r_m: 0.1, valence: 0.6, arousal: 0.1 }),
+    ]
+    const { provider } = makeEmbedding({ q: [1, 0] })
+    const lookup: MemoryLookup = { retrievable: () => items }
+    const retriever = new MemoryRetriever({ embedding: provider, reranker: zeroReranker(), lookup, config: makeConfig() })
+    const out = await retriever.retrieve('q', { ablation: 'csls', mood: { state: mood, alpha: 0.2 } })
+    expect(out.stages.csls.find(c => c.id === 'node')?.moodSim).toBeUndefined()
+    expect(ids(out.stages.csls)[0]).toBe('rec') // rec 有（负向）moodSim 也不敌纯 cue 序
+  })
+
+  it('不传 mood 时与无情绪版本恒等：候选无 moodSim 字段', async () => {
+    const items = itemsWithAffect()
+    const { provider } = makeEmbedding({ q: [1, 0] })
+    const lookup: MemoryLookup = { retrievable: () => items }
+    const retriever = new MemoryRetriever({ embedding: provider, reranker: zeroReranker(), lookup, config: makeConfig() })
+    const out = await retriever.retrieve('q', { ablation: 'csls' })
+    for (const c of out.stages.csls) expect(c.moodSim).toBeUndefined()
+  })
+
+  function zeroReranker(): RerankerProvider {
+    return { rerank: async (_q, docs) => docs.map(() => 0) }
+  }
 })

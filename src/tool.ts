@@ -5,15 +5,17 @@
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { MemoryRetriever } from './retrieval.js'
+import type { MemoryRetriever, RetrieveOptions } from './retrieval.js'
 import type { Config } from './config.js'
-import type { MemoryTier, RetrievalResult, ScoredCandidate } from './types.js'
+import type { MemoryTier, MoodState, RetrievalResult, ScoredCandidate } from './types.js'
 
 /** 按 agent 解析出的作用域内检索依赖（M2：检索与计分必须落在同一 scope）。 */
 export interface MemoryScopeDeps {
   readonly retriever: MemoryRetriever
   /** 使用记账钩子（winners/suppressed counters），fire-and-forget。 */
   readonly recordRetrieval: (result: RetrievalResult) => void
+  /** 情绪重排上下文（P3-1）：仅情绪白名单工作区且该作用域已有 mood 时出现。 */
+  readonly mood?: { readonly state: MoodState; readonly alpha: number }
 }
 
 export interface MemorySearchDeps {
@@ -189,7 +191,8 @@ export function createMemorySearchTool(deps: MemorySearchDeps) {  const maxResul
         signal: exec.signal,
         topK: args.limit ?? maxResults,
         at,
-      })
+        ...(scope.mood !== undefined ? { mood: scope.mood } : {}),
+      } satisfies RetrieveOptions)
       scope.recordRetrieval(result)
       const output: SearchOutput = {
         query: args.query,

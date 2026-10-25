@@ -1,6 +1,6 @@
 {
   "name": "dsh-mem",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Semantic-driven long-term memory plugin for DeepSeek Harness (dsh): forgetting and consolidation driven by semantics, never by time.",
   "type": "module",
   "main": "./lib/index.js",
@@ -21,7 +21,8 @@
     "test": "vitest run",
     "eval:ndcg": "node scripts/eval-ndcg.mjs",
     "eval:sleep": "node scripts/eval-sleep.mjs",
-    "eval:semtime": "node scripts/eval-semtime.mjs"
+    "eval:semtime": "node scripts/eval-semtime.mjs",
+    "eval:emotion": "node scripts/eval-emotion.mjs"
   },
   "keywords": [
     "dsh",

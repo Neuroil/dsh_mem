@@ -393,6 +393,8 @@ export class MemoryStore {
       tier: record.tier,
       createdAt: record.time_meta.created_at,
       layer: 'episodic',
+      valence: record.valence,
+      arousal: record.arousal,
     }
   }
 

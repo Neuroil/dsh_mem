@@ -77,6 +77,7 @@ const config = {
   section: { enabled: true, maxMemories: 5, header: 'memories:' },
   tool: { enabled: true, maxResults: 5 },
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
+  emotion: { workspaces: [], alpha: 0.15, tauHours: 4, disclose: false },
 }
 
 // ---- scripted echo LLM: gist/QA/answers derived from the prompt itself ----

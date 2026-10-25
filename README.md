@@ -355,7 +355,7 @@ turn/end 信号门控触发（自上次周期新写入 ≥ `sleep.minNewMemories
 |---|---|
 | `src/` | 插件源码（模块地图见[开发](#开发)） |
 | `lib/` | `npm run build` 产物（ESM + .d.ts） |
-| `tests/` | 211 个离线单测（vitest，无需网络与 API key） |
+| `tests/` | 238 个离线单测（vitest，无需网络与 API key） |
 | `scripts/eval-ndcg.mjs` | §7.1 检索四档消融脚手架 |
 | `scripts/eval-sleep.mjs` | P1 睡眠周期脚手架（QA 保留率、压缩后召回存续） |
 | `scripts/eval-semtime.mjs` | P2 语义 vs 时间消融脚手架（§7.4 关键消融 + 时间旅行） |
@@ -510,6 +510,7 @@ src/
 |---|---|
 | `storage.backend` / `unit` / `version` / `workspaceScope`(true) | KV 后端名（json/sqlite）、unit 名前缀与无 cwd 回退名（**不含连字符**，规则同宿主 `/^[a-z][a-z0-9_]*$/`，连字符会被归一为下划线）、格式版本、按工作区一区一库开关（false = 全局单库旧行为；工作区 unit 名 = `<unit>_ws_<路径哈希>`） |
 | `intake.session.enabled`(true) / `acceptSourceKinds`(['user']) | 会话历史入口：停写开关（检索不受影响）与"什么算人类输入"的 source.kind 白名单（IM 适配器自定义 kind 加进列表即可；带 `form` 的插件上下文恒不算对话） |
+| `emotion.workspaces`(**[]**) / `alpha`(0.15≤0.2) / `tauHours`(4) / `disclose`(false) | 按工作区的情绪编码（P3-1）：白名单（归一化路径精确匹配，空=全部 bypass 恒等）、情绪重排权重（只进语义筛选后的排序键，cold 门控/L0 召回纯语义）、mood 衰减常数、心境披露开关 |
 | `embedding.*` | mode(http/deterministic)、endpoint、model、apiKey、dimensions(1024)、batchSize——endpoint 出厂默认 SiliconFlow；本地 llama.cpp 为 `http://127.0.0.1:8080/v1/embeddings`（见「推荐：本地部署 llama.cpp」） |
 | `reranker.*` | 同上（无 dimensions；本地 llama.cpp 为 `http://127.0.0.1:8081/v1/rerank`） |
 | `llm.provider` / `model` / `temperature`(0) / `maxTokens` | 内部判分调用（经 ctx.llm） |
@@ -545,6 +546,7 @@ src/
 | 压缩后检索不到原细节 | 设计行为：成员内容由节点 gist 承载（§2.3"记住要点、忘掉细节"）；回溯经 `flags.compressed_into` 索引原记录，或用 `memory_search` 的 `at` 参数在归档前的时点检索 |
 | 记忆还在但排不上名 | tier 可能已沉到 cold（S 动态：长期未使用 + 兜底衰减）：cold 项需 CSLS cue ≥ `cueThreshold + coldCueBoost` 才保留；调 `tier.coldThreshold` / `score.decayTauDays`，或等使用事件把它推回 warm |
 | `memory_search` 返回 `invalid 'at'` | `at` 需为 ISO 8601（以 4 位年份开头）或正整数 epoch ms；领域级错误写进规范值，不影响工具通道 |
+| 情绪重排不生效 / mood 不更新 | 工作区不在 `emotion.workspaces` 白名单（默认空 = 全部 bypass）；核对路径写法（大小写/分隔符不敏感但须精确匹配，非前缀）；mood τ=4h 衰减，隔日归零属正常；消融脚本 `npm run eval:emotion` 可离线验证 |
 | 聊天 UI 没有 `memory_clear` 工具卡片 | 默认关闭（破坏性工具）：config 加 `tool: { clear: true }`（HMR 即生效），启动日志 `clearTool=true` 旁证；它只清**当前工作区**的库，换嵌入模型/版本迁移等全清场景仍以删介质文件为准 |
 
 ## 明确不在 P2（后续里程碑）

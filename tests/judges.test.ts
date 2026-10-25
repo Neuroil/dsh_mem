@@ -60,14 +60,28 @@ describe('parseJsonLoose', () => {
 describe('extractCandidates', () => {
   it('空消息不调 LLM', async () => {
     const llm = new FakeLlm([])
-    expect(await extractCandidates(llm, [], writeConfig)).toEqual([])
+    expect(await extractCandidates(llm, [], writeConfig)).toEqual({ candidates: [] })
     expect(llm.calls.length).toBe(0)
   })
 
-  it('返回字符串数组并截断到 maxCandidates；非字符串与重复项被过滤', async () => {
-    const llm = new FakeLlm(['```json\n["m1", 42, "m1", "m2", "m3", "m4"]\n```'])
+  it('解析 memories 数组并截断到 maxCandidates；非字符串与重复项被过滤；turn_mood 夹取', async () => {
+    const llm = new FakeLlm(['```json\n{"memories": ["m1", 42, "m1", "m2", "m3", "m4"], "turn_mood": {"valence": -2, "arousal": 5}}\n```'])
     const out = await extractCandidates(llm, [{ role: 'user', text: 'hi' }], writeConfig)
-    expect(out).toEqual(['m1', 'm2', 'm3', 'm4'])
+    expect(out.candidates).toEqual(['m1', 'm2', 'm3', 'm4'])
+    expect(out.turnMood).toEqual({ valence: -1, arousal: 1 }) // 夹取到 [-1,1]/[0,1]
+  })
+
+  it('turn_mood 缺失/非法按无观测处理（宽容，不触发重试）', async () => {
+    const missing = new FakeLlm(['{"memories": ["m1"]}'])
+    const out1 = await extractCandidates(missing, [{ role: 'user', text: 'hi' }], writeConfig)
+    expect(out1.candidates).toEqual(['m1'])
+    expect(out1.turnMood).toBeUndefined()
+
+    const invalid = new FakeLlm(['{"memories": ["m1"], "turn_mood": {"valence": "sad", "arousal": 0.5}}'])
+    const out2 = await extractCandidates(invalid, [{ role: 'user', text: 'hi' }], writeConfig)
+    expect(out2.candidates).toEqual(['m1'])
+    expect(out2.turnMood).toBeUndefined()
+    expect(invalid.calls.length).toBe(1) // 未重试
   })
 
   it('解析失败重试一次，仍失败抛错', async () => {
@@ -76,9 +90,9 @@ describe('extractCandidates', () => {
     expect(llm.calls.length).toBe(2)
   })
 
-  it('返回非数组（结构校验失败）同样重试一次，仍非数组抛错', async () => {
-    const llm = new FakeLlm(['{"candidates": ["m1"]}', '{"candidates": ["m2"]}'])
-    await expect(extractCandidates(llm, [{ role: 'user', text: 'hi' }], writeConfig)).rejects.toThrow(/非 JSON 数组/)
+  it('缺 memories 数组（结构校验失败）同样重试一次，仍失败抛错', async () => {
+    const llm = new FakeLlm(['["m1"]', '["m2"]'])
+    await expect(extractCandidates(llm, [{ role: 'user', text: 'hi' }], writeConfig)).rejects.toThrow(/缺少 memories 数组/)
     expect(llm.calls.length).toBe(2)
   })
 })

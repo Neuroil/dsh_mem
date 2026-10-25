@@ -137,6 +137,23 @@ export interface IntakeConfig {
   }
 }
 
+/** 情绪编码（P3-1，设计 §10.1）：按工作区白名单启用；agent 工作区完全 bypass。 */
+export interface EmotionConfig {
+  /**
+   * 启用情绪编码的工作区白名单（归一化路径精确匹配，同 scope.ts 规则）。
+   * 空列表 = 全部 bypass = 检索行为与无情绪版本恒等（默认）。白名单工作区：
+   * mood 状态维护 + CSLS 情绪重排 + 可选披露；写入侧（M5 valence/arousal
+   * 落盘）恒开，与白名单无关。
+   */
+  workspaces: string[]
+  /** 情绪重排权重：排序键 cue' = cue + α·moodSim；只进排序，不进召回与 cold 门控。上限 0.2。 */
+  alpha: number
+  /** mood 惰性衰减时间常数（小时）：跨会话持久、向基线 (0,0) 衰减。 */
+  tauHours: number
+  /** 注入 section 末尾附一行当前心境（仅白名单工作区生效；默认 false）。 */
+  disclose: boolean
+}
+
 export interface StorageConfig {
   /** Backend name registered on ctx.storage (`json` / `sqlite`). */
   backend: string
@@ -165,6 +182,7 @@ export interface Config {
   section: SectionConfig
   tool: ToolConfig
   intake: IntakeConfig
+  emotion: EmotionConfig
 }
 
 const httpModel = (defaults: { endpoint: string; model: string; timeoutMs: number }) =>
@@ -329,4 +347,12 @@ export const Config: Schema<Config> = Schema.object({
       acceptSourceKinds: Schema.array(Schema.string()).default(['user']),
     }).default({ enabled: true, acceptSourceKinds: ['user'] }),
   }).default({ session: { enabled: true, acceptSourceKinds: ['user'] } }),
+
+  // 情绪编码（P3-1）：见 EmotionConfig 注释
+  emotion: Schema.object({
+    workspaces: Schema.array(Schema.string()).default([]),
+    alpha: Schema.number().min(0).max(0.2).default(0.15),
+    tauHours: Schema.number().min(0.1).default(4),
+    disclose: Schema.boolean().default(false),
+  }).default({ workspaces: [], alpha: 0.15, tauHours: 4, disclose: false }),
 })

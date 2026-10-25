@@ -24,6 +24,7 @@ const testConfig = (): Config => ({
   section: { enabled: true, maxMemories: 5, header: 'memories:' },
   tool: { enabled: true, maxResults: 5, clear: false },
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
+  emotion: { workspaces: [], alpha: 0.15, tauHours: 4, disclose: false },
 })
 
 /** 全字段 MemoryRecord（对照 types.ts；r_m/red/epi 为 0，con_route pending，counters 全 0）。 */

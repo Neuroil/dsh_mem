@@ -46,6 +46,7 @@ const BASE_CONFIG: Config = {
   section: { enabled: true, maxMemories: 5, header: 'memories:' },
   tool: { enabled: true, maxResults: 5 },
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
+  emotion: { workspaces: [], alpha: 0.15, tauHours: 4, disclose: false },
 }
 
 /** 覆写 sleep 段超参（其余段沿用 BASE_CONFIG）。 */

@@ -6,6 +6,7 @@
  * （§3.6 的词法特征部分）。
  */
 import type { WriteConfig } from './config.js'
+import { clampAffect } from './emotion.js'
 import { sigmoid } from './metrics.js'
 import type {
   ContradictionJudgment,
@@ -83,39 +84,53 @@ async function completeJson<T>(
 }
 
 const EXTRACT_SYSTEM = `You distill durable memories from a conversation.
-Return ONLY a JSON array of at most the requested number of memory candidates.
-Each element is a plain string: a self-contained, third-person statement of a
-fact, preference, decision, or commitment worth remembering across sessions
-(user identity, stable preferences, decisions and their reasons, recurring
-tasks). Skip transient chatter, greetings, and anything derivable from the
-immediately visible context. Write each memory in the language it was expressed
-in. No numbering, no explanations, no JSON object wrapper — just the array.`
+Return ONLY a JSON object with exactly two keys:
+- "memories": an array of at most the requested number of candidates. Each
+  element is a plain string: a self-contained, third-person statement of a
+  fact, preference, decision, or commitment worth remembering across sessions
+  (user identity, stable preferences, decisions and their reasons, recurring
+  tasks). Skip transient chatter, greetings, and anything derivable from the
+  immediately visible context. Write each memory in the language it was
+  expressed in. No numbering, no explanations.
+- "turn_mood": your estimate of the OVERALL emotional tone of this exchange as
+  {"valence": <number in -1..1, negative to positive>, "arousal": <number in
+  0..1, calm to excited>}. Estimate it even when the exchange seems neutral
+  (then use values near 0).
+No text outside the JSON object.`
 
-/** 批量候选抽取（§5.1，每轮一次调用）。 */
+/** turn 级整体情绪估计（抽取调用顺带产出，P3-1）：非法/缺失时 undefined（宽容，不触发重试）。 */
+export interface TurnExtraction {
+  readonly candidates: readonly string[]
+  readonly turnMood?: { readonly valence: number; readonly arousal: number }
+}
+
+/** 批量候选抽取（§5.1，每轮一次调用；P3-1 起顺带产出 turn 级情绪）。 */
 export async function extractCandidates(
   llm: InternalLlm,
   messages: readonly TurnMessage[],
   config: WriteConfig,
   signal?: AbortSignal,
-): Promise<readonly string[]> {
-  if (messages.length === 0) return []
+): Promise<TurnExtraction> {
+  if (messages.length === 0) return { candidates: [] }
   const transcript = messages
     .map((m) => `${m.role === 'user' ? 'USER' : 'ASSISTANT'}: ${m.text}`)
     .join('\n\n')
-  const parsed = await completeJson(
+  const parsed = await completeJson<{ memories: readonly unknown[]; turn_mood?: { valence?: unknown; arousal?: unknown } }>(
     llm,
     EXTRACT_SYSTEM,
-    `Conversation:\n\n${transcript}\n\nReturn up to ${config.maxCandidates} memory candidates as a JSON array of strings.`,
+    `Conversation:\n\n${transcript}\n\nReturn up to ${config.maxCandidates} memory candidates and the turn mood as specified.`,
     (raw) => {
-      // 非数组属结构校验失败：抛错触发重试（与 M5/矛盾判定的重试语义一致）
-      if (!Array.isArray(raw)) throw new Error('候选抽取返回非 JSON 数组')
-      return raw
+      // 非「memories 数组」对象属结构校验失败：抛错触发重试（与 M5/矛盾判定的重试语义一致）
+      if (typeof raw !== 'object' || raw === null || !Array.isArray((raw as { memories?: unknown }).memories)) {
+        throw new Error('候选抽取返回的 JSON 缺少 memories 数组')
+      }
+      return raw as { memories: readonly unknown[]; turn_mood?: { valence?: unknown; arousal?: unknown } }
     },
     signal,
   )
   const seen = new Set<string>()
   const candidates: string[] = []
-  for (const item of parsed) {
+  for (const item of parsed.memories) {
     if (typeof item !== 'string') continue
     const text = item.trim()
     if (!text || seen.has(text)) continue
@@ -123,7 +138,13 @@ export async function extractCandidates(
     candidates.push(text)
     if (candidates.length >= config.maxCandidates) break
   }
-  return candidates
+  // turn_mood 宽容处理：缺失/非法按无观测处理（情绪聚合容忍空洞），夹取到合法域
+  const rawMood = parsed.turn_mood
+  const turnMood =
+    typeof rawMood === 'object' && rawMood !== null
+      ? clampAffect(rawMood.valence, rawMood.arousal)
+      : undefined
+  return { candidates, ...(turnMood !== undefined ? { turnMood } : {}) }
 }
 
 const IMPORTANCE_SYSTEM = `You score how strongly a memory deserves long-term consolidation.

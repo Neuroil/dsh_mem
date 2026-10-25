@@ -34,6 +34,12 @@ export interface WriteOutcome {
   readonly superseded: readonly { id: string; by: string }[]
   /** 低分 + 重复(NOOP) + 单条失败的总数。 */
   readonly dropped: number
+  /**
+   * 本轮对话的整体情绪估计（P3-1：抽取调用顺带产出，缺失/非法时无此字段）。
+   * 情绪白名单工作区由 runtime 并入 mood 状态；判分与抽取提示词对当前
+   * mood 无感知（写入侧无偏）。
+   */
+  readonly turnMood?: { readonly valence: number; readonly arousal: number }
 }
 
 /** §2.1 分层：S ≥ hot → hot；S < cold → cold；否则 warm。 */
@@ -72,17 +78,19 @@ export class WritePipeline {
     let dropped = 0
 
     const window = messages.slice(-config.write.messageWindow)
-    const candidates = await extractCandidates(this.deps.llm, window, config.write, signal)
+    const extraction = await extractCandidates(this.deps.llm, window, config.write, signal)
 
     // 与库中已有记忆文本完全相同的候选走 NOOP（§2.5 重复→合并）；候选内去重
     const existingTexts = new Set(this.deps.store.validMemories().map((record) => record.text))
     const seen = new Set<string>()
-    const fresh = candidates.filter((text) => {
+    const fresh = extraction.candidates.filter((text) => {
       if (existingTexts.has(text) || seen.has(text)) return false
       seen.add(text)
       return true
     })
-    if (fresh.length === 0) return { turn, written, superseded, dropped }
+    if (fresh.length === 0) {
+      return { turn, written, superseded, dropped, ...(extraction.turnMood !== undefined ? { turnMood: extraction.turnMood } : {}) }
+    }
 
     // 嵌入一次批量完成（§5.4 写入成本行）
     const vectors = await this.deps.embedding.embed(fresh, signal)
@@ -165,6 +173,6 @@ export class WritePipeline {
       }
     }
 
-    return { turn, written, superseded, dropped }
+    return { turn, written, superseded, dropped, ...(extraction.turnMood !== undefined ? { turnMood: extraction.turnMood } : {}) }
   }
 }

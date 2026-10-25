@@ -16,6 +16,7 @@ const config: Config = {
   section: { enabled: true, maxMemories: 5, header: 'memories:' },
   tool: { enabled: true, maxResults: 5 },
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
+  emotion: { workspaces: [], alpha: 0.15, tauHours: 4, disclose: false },
 }
 
 function makeRecord(over: Partial<MemoryRecord> = {}): MemoryRecord {
@@ -140,7 +141,7 @@ describe('WritePipeline.processTurn', () => {
   it('全流程：抽取→M5→（无矛盾）→入库→刷新邻域；S=imp、tier 正确', async () => {
     const store = new FakeStore()
     const llm = new FakeLlm([
-      '["用户把默认数据库从 MySQL 迁移到 Postgres"]', // 抽取
+      '{"memories": ["用户把默认数据库从 MySQL 迁移到 Postgres"], "turn_mood": {"valence": 0, "arousal": 0}}', // 抽取
       ...importances(9), // M5 → hot
     ])
     const pipeline = new WritePipeline({ llm, embedding, store, config, now: () => 1234 })
@@ -160,7 +161,7 @@ describe('WritePipeline.processTurn', () => {
 
   it('M5 低分候选被丢弃不入库', async () => {
     const store = new FakeStore()
-    const llm = new FakeLlm(['["闲聊一句话"]', ...importances(2)])
+    const llm = new FakeLlm(['{"memories": ["闲聊一句话"], "turn_mood": {"valence": 0, "arousal": 0}}', ...importances(2)])
     const pipeline = new WritePipeline({ llm, embedding, store, config })
     const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
     expect(outcome.written).toEqual([])
@@ -176,7 +177,7 @@ describe('WritePipeline.processTurn', () => {
     store.records.set('old-1', existing)
     store.nextNeighbors = [{ id: 'old-1', cos: 0.93, record: existing }]
     const llm = new FakeLlm([
-      '["用户把默认数据库从 MySQL 换成了 Postgres"]',
+      '{"memories": ["用户把默认数据库从 MySQL 换成了 Postgres"], "turn_mood": {"valence": 0, "arousal": 0}}',
       ...importances(7),
       '{"index":0,"verdict":"contradicts"}',
     ])
@@ -192,7 +193,7 @@ describe('WritePipeline.processTurn', () => {
     const store = new FakeStore()
     const existing = makeRecord({ id: 'old-2', text: '用户在维护数据库迁移工具' })
     store.nextNeighbors = [{ id: 'old-2', cos: 0.85, record: existing }]
-    const llm = new FakeLlm(['["用户为迁移工具写了回滚脚本"]', ...importances(6), '{"index":0,"verdict":"complements"}'])
+    const llm = new FakeLlm(['{"memories": ["用户为迁移工具写了回滚脚本"], "turn_mood": {"valence": 0, "arousal": 0}}', ...importances(6), '{"index":0,"verdict":"complements"}'])
     const pipeline = new WritePipeline({ llm, embedding, store, config })
     const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
     expect(outcome.written[0]!.links).toEqual([{ kind: 'complements', target: 'old-2' }])
@@ -203,7 +204,7 @@ describe('WritePipeline.processTurn', () => {
     const store = new FakeStore()
     const existing = makeRecord({ id: 'old-3', text: '用户用 Postgres' })
     store.nextNeighbors = [{ id: 'old-3', cos: 0.99, record: existing }]
-    const llm = new FakeLlm(['["用户用 Postgres"]', ...importances(6), '{"index":0,"verdict":"duplicate"}'])
+    const llm = new FakeLlm(['{"memories": ["用户用 Postgres"], "turn_mood": {"valence": 0, "arousal": 0}}', ...importances(6), '{"index":0,"verdict":"duplicate"}'])
     const pipeline = new WritePipeline({ llm, embedding, store, config })
     const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
     expect(outcome.written).toEqual([])
@@ -214,10 +215,14 @@ describe('WritePipeline.processTurn', () => {
   it('与库中已有文本完全相同的候选走 NOOP（不消耗 M5 调用）', async () => {
     const store = new FakeStore()
     store.records.set('old-4', makeRecord({ id: 'old-4', text: '已存在的记忆文本' }))
-    const llm = new FakeLlm(['["已存在的记忆文本"]']) // 只有抽取一次调用
+    const llm = new FakeLlm(['{"memories": ["已存在的记忆文本"], "turn_mood": {"valence": 0, "arousal": 0}}']) // 只有抽取一次调用
     const pipeline = new WritePipeline({ llm, embedding, store, config })
     const outcome = await pipeline.processTurn('s1', 1, [{ role: 'user', text: '随便' }])
-    expect(outcome).toEqual({ turn: 1, written: [], superseded: [], dropped: 0 })
+    // P3-1：turnMood 透传与记忆写入无关——无候选幸存时也携带本轮情绪观测
+    expect(outcome).toEqual({
+      turn: 1, written: [], superseded: [], dropped: 0,
+      turnMood: { valence: 0, arousal: 0 },
+    })
     expect(llm.completions.length).toBe(1)
   })
 
@@ -225,7 +230,7 @@ describe('WritePipeline.processTurn', () => {
     const store = new FakeStore()
     const existing = makeRecord({ id: 'far-1', text: '无关记忆' })
     store.nextNeighbors = [{ id: 'far-1', cos: 0.5, record: existing }]
-    const llm = new FakeLlm(['["候选"]', ...importances(6)]) // 无第三次调用
+    const llm = new FakeLlm(['{"memories": ["候选"], "turn_mood": {"valence": 0, "arousal": 0}}', ...importances(6)]) // 无第三次调用
     const pipeline = new WritePipeline({ llm, embedding, store, config })
     const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
     expect(outcome.written.length).toBe(1)
@@ -235,7 +240,7 @@ describe('WritePipeline.processTurn', () => {
   it('单候选失败不中断整轮：其余候选入库', async () => {
     const store = new FakeStore()
     const llm = new FakeLlm([
-      '["候选甲", "候选乙"]',
+      '{"memories": ["候选甲", "候选乙"], "turn_mood": {"valence": 0, "arousal": 0}}',
       '坏掉的回复', // 甲的 M5 第一次失败
       '还是坏的', // 甲的 M5 重试失败 → 甲 dropped
       ...importances(7), // 乙的 M5
@@ -251,7 +256,7 @@ describe('WritePipeline.processTurn', () => {
   it('signal 传播到 LLM 调用', async () => {
     const store = new FakeStore()
     const controller = new AbortController()
-    const llm = new FakeLlm(['["候选"]'])
+    const llm = new FakeLlm(['{"memories": ["候选"], "turn_mood": {"valence": 0, "arousal": 0}}'])
     const pipeline = new WritePipeline({ llm, embedding, store, config })
     await pipeline.processTurn('s1', 1, MESSAGES, controller.signal)
     expect(llm.completions[0]!.signal).toBe(controller.signal)
@@ -259,7 +264,7 @@ describe('WritePipeline.processTurn', () => {
 
   it('messageWindow 截断：抽取只看到窗口内消息', async () => {
     const store = new FakeStore()
-    const llm = new FakeLlm(['["候选"]', ...importances(5)])
+    const llm = new FakeLlm(['{"memories": ["候选"], "turn_mood": {"valence": 0, "arousal": 0}}', ...importances(5)])
     const pipeline = new WritePipeline({ llm, embedding, store, config: { ...config, write: { ...config.write, messageWindow: 2 } } })
     const longHistory = [
       { role: 'user' as const, text: 'msg1' }, { role: 'assistant' as const, text: 'msg2' },
@@ -285,7 +290,7 @@ describe('WritePipeline.processTurn', () => {
         })
       },
     }
-    const llm = new FakeLlm(['["候选甲", "候选乙"]', ...importances(7)])
+    const llm = new FakeLlm(['{"memories": ["候选甲", "候选乙"], "turn_mood": {"valence": 0, "arousal": 0}}', ...importances(7)])
     const pipeline = new WritePipeline({ llm, embedding: gappy, store, config })
     const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
     expect(outcome.written.length).toBe(1)
@@ -304,7 +309,7 @@ describe('WritePipeline.processTurn', () => {
       },
     }
     // 抽取后队列耗尽：甲的 M5 两次调用均抛 → completeJson 抛 → catch 分支按 aborted 上抛
-    const llm = new FakeLlm(['["候选甲", "候选乙"]'])
+    const llm = new FakeLlm(['{"memories": ["候选甲", "候选乙"], "turn_mood": {"valence": 0, "arousal": 0}}'])
     const pipeline = new WritePipeline({ llm, embedding: abortingEmbed, store, config })
     await expect(pipeline.processTurn('s1', 1, MESSAGES, controller.signal)).rejects.toThrow()
     expect(store.records.size).toBe(0)
@@ -324,7 +329,7 @@ describe('WritePipeline.processTurn', () => {
       },
     }
     const llm = new FakeLlm([
-      '["用户使用 Postgres", "用户使用 Postgres 作为主数据库"]',
+      '{"memories": ["用户使用 Postgres", "用户使用 Postgres 作为主数据库"], "turn_mood": {"valence": 0, "arousal": 0}}',
       ...importances(7), // 甲 M5（此时库空，无矛盾调用）
       ...importances(7), // 乙 M5
       '{"index":0,"verdict":"duplicate"}', // 乙对甲（同轮先入库）判定为重复
@@ -343,7 +348,7 @@ describe('WritePipeline.processTurn 矛盾判定完整版（§2.5，P2）', () =
     const existing = makeRecord({ id: 'old-1', text: '用户 2024 年默认数据库是 MySQL' })
     store.nextNeighbors = [{ id: 'old-1', cos: 0.93, record: existing }]
     const llm = new FakeLlm([
-      '["用户现在默认数据库是 PostgreSQL"]',
+      '{"memories": ["用户现在默认数据库是 PostgreSQL"], "turn_mood": {"valence": 0, "arousal": 0}}',
       ...importances(7),
       '{"index":0,"verdict":"contradicts","temporal":"disjoint"}',
     ])
@@ -362,7 +367,7 @@ describe('WritePipeline.processTurn 矛盾判定完整版（§2.5，P2）', () =
     const existing = makeRecord({ id: 'old-1', text: '用户默认数据库是 MySQL' })
     store.nextNeighbors = [{ id: 'old-1', cos: 0.93, record: existing }]
     const llm = new FakeLlm([
-      '["用户把默认数据库换成了 PostgreSQL"]',
+      '{"memories": ["用户把默认数据库换成了 PostgreSQL"], "turn_mood": {"valence": 0, "arousal": 0}}',
       ...importances(7),
       '{"index":0,"verdict":"contradicts"}', // 无 temporal 字段
     ])
@@ -377,7 +382,7 @@ describe('WritePipeline.processTurn 矛盾判定完整版（§2.5，P2）', () =
     store.nodes.set('node-1', node)
     store.nextNodeNeighbors = [{ id: 'node-1', cos: 0.95, node }]
     const llm = new FakeLlm([
-      '["用户已把生产数据库迁移到 MySQL"]',
+      '{"memories": ["用户已把生产数据库迁移到 MySQL"], "turn_mood": {"valence": 0, "arousal": 0}}',
       ...importances(8),
       '{"index":0,"verdict":"contradicts","temporal":"overlapping"}',
     ])
@@ -399,7 +404,7 @@ describe('WritePipeline.processTurn 矛盾判定完整版（§2.5，P2）', () =
     store.nextNeighbors = [{ id: 'rec-1', cos: 0.9, record: existing }]
     store.nextNodeNeighbors = [{ id: 'node-1', cos: 0.95, node }]
     const llm = new FakeLlm([
-      '["用户为迁移工具补了数据校验"]',
+      '{"memories": ["用户为迁移工具补了数据校验"], "turn_mood": {"valence": 0, "arousal": 0}}',
       ...importances(6),
       '{"index":1,"verdict":"complements"}', // index=1 → 第二项 = 节点
     ])
@@ -416,7 +421,7 @@ describe('WritePipeline.processTurn 矛盾判定完整版（§2.5，P2）', () =
     const node = makeNode({ id: 'node-1', gist: '无关节点' })
     store.nextNodeNeighbors = [{ id: 'node-1', cos: 0.5, node }]
     store.nextNeighbors = []
-    const llm = new FakeLlm(['["候选"]', ...importances(6)]) // 无第三次调用
+    const llm = new FakeLlm(['{"memories": ["候选"], "turn_mood": {"valence": 0, "arousal": 0}}', ...importances(6)]) // 无第三次调用
     const pipeline = new WritePipeline({ llm, embedding, store, config })
     const outcome = await pipeline.processTurn('s1', 1, MESSAGES)
     expect(outcome.written.length).toBe(1)

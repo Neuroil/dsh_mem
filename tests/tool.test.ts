@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ToolExecution } from '@deepseek-ai/dsh-tools'
 import { createMemoryClearTool, createMemorySearchTool, formatMemories, parseAt } from '../src/tool.js'
 import type { MemoryRetriever } from '../src/retrieval.js'
+import type { MoodState } from '../src/types.js'
 import type { Config } from '../src/config.js'
 import type { RetrievalResult } from '../src/types.js'
 
@@ -23,6 +24,7 @@ const config: Config = {
   section: { enabled: true, maxMemories: 5, header: 'memories:' },
   tool: { enabled: true, maxResults: 5, clear: false },
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
+  emotion: { workspaces: [], alpha: 0.15, tauHours: 4, disclose: false },
 }
 
 /** 检索器替身：记录调用参数并回放固定结果。 */
@@ -32,9 +34,13 @@ function makeRetriever(result: RetrievalResult) {
 }
 
 /** 工具依赖替身（M2：resolve 按作用域返回检索/计分依赖；测试恒返回同一替身）。 */
-function makeDeps(retriever: ReturnType<typeof makeRetriever>['retriever'], onRetrieved: () => void = () => {}) {
+function makeDeps(
+  retriever: ReturnType<typeof makeRetriever>['retriever'],
+  onRetrieved: () => void = () => {},
+  mood?: { state: MoodState; alpha: number },
+) {
   return {
-    resolve: async () => ({ retriever, recordRetrieval: onRetrieved }),
+    resolve: async () => ({ retriever, recordRetrieval: onRetrieved, ...(mood !== undefined ? { mood } : {}) }),
     recentTurns: () => [] as readonly string[],
     config,
   }
@@ -190,5 +196,26 @@ describe('memory_clear.execute（开发/测试工具：硬删除全库）', () =
     const refused = await tool.execute({ confirm: false }, execClear) as never
     const refusedBlocks = tool.output.render({ confirm: false }, refused)
     expect(String((refusedBlocks[0] as { text: string }).text)).toContain('memory_clear refused')
+  })
+})
+
+describe('memory_search 情绪透传（P3-1）', () => {
+  it('resolve 返回 mood 时透传给检索器（情绪白名单工作区）', async () => {
+    const { retriever, retrieve } = makeRetriever(emptyResult())
+    const mood = { state: { valence: -0.4, arousal: 0.7, updated_at: 1 }, alpha: 0.15 }
+    const tool = createMemorySearchTool(makeDeps(retriever, () => {}, mood))
+
+    await tool.execute({ query: 'q' }, exec)
+
+    expect(retrieve.mock.calls[0]![1]).toMatchObject({ mood })
+  })
+
+  it('resolve 未返回 mood 时不传该选项（agent 工作区恒等）', async () => {
+    const { retriever, retrieve } = makeRetriever(emptyResult())
+    const tool = createMemorySearchTool(makeDeps(retriever))
+
+    await tool.execute({ query: 'q' }, exec)
+
+    expect((retrieve.mock.calls[0]![1] as Record<string, unknown>)['mood']).toBeUndefined()
   })
 })

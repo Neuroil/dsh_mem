@@ -5,9 +5,11 @@
  * MemoryLookup 注入，不依赖宿主框架，可独立测试。
  */
 import type { RetrievalConfig } from './config.js'
+import { moodSim } from './emotion.js'
 import { cosine, cslsCue, mean, mmrSelect } from './metrics.js'
 import type {
   EmbeddingProvider,
+  MoodState,
   RerankerProvider,
   RetrievableItem,
   RetrievalAblation,
@@ -48,6 +50,12 @@ export interface RetrieveOptions {
   readonly topK?: number
   /** 时间旅行时点（epoch ms，§2.5 完整版）：检索池换为该时点的记忆状态。 */
   readonly at?: number
+  /**
+   * 情绪重排上下文（P3-1，仅情绪白名单工作区由 runtime 传入）：L0 召回池
+   * 纯语义不变，情绪项只进 CSLS 排序键 cue + α·moodSim；cold 门控用纯 cue。
+   * 缺省时全链路与无情绪版本逐字节一致。
+   */
+  readonly mood?: { readonly state: MoodState; readonly alpha: number }
 }
 
 /** id 字典序，平局时的确定性决胜（保证测试可复现）。 */
@@ -106,13 +114,29 @@ export class MemoryRetriever {
     }
 
     // ---- CSLS 重排（§3.2）：r(q) 取 L0 候选池余弦均值；cue = 2·cos − r(q) − r(m)
+    // P3-1 情绪重排（稳定路线）：α·moodSim 只加进**语义筛选后**的排序键（CSLS
+    // 排序、精排截断、MMR 相关性输入——只动排序不动召回，效果须能传到最终
+    // top，否则被下游语义重排稀释归零）；**cold 门控与 L0 召回用纯 cue/纯余弦**
+    // （冷层记忆不得凭情绪契合混过门槛——侧门封死）。候选项无情绪判分（语义
+    // 节点 / 旧记录）或未传 mood 时 sim 缺省、排序键 = 纯值（与无情绪版本恒等）。
+    const moodCtx = opts.mood
+    const moodBonus = (c: ScoredCandidate): number =>
+      moodCtx !== undefined && c.moodSim !== undefined ? moodCtx.alpha * c.moodSim : 0
     const rQuery = mean(stages.l0.map(c => c.cos))
-    const withCue = stages.l0.map(c => ({ ...c, cue: cslsCue(c.cos, rQuery, c.item.r_m) }))
+    const withCue = stages.l0.map(c => {
+      const cue = cslsCue(c.cos, rQuery, c.item.r_m)
+      const sim =
+        moodCtx !== undefined && c.item.valence !== undefined && c.item.arousal !== undefined
+          ? moodSim(moodCtx.state, c.item.valence, c.item.arousal)
+          : undefined
+      return sim === undefined ? { ...c, cue } : { ...c, cue, moodSim: sim }
+    })
+    const cslsSortKey = (c: ScoredCandidate): number => (c.cue ?? 0) + moodBonus(c)
     // cold 层门控（§5.2）：cold 项 cue 需达到 cueThreshold + coldCueBoost 才保留
     const coldFloor = cfg.cueThreshold + cfg.coldCueBoost
     stages.csls = withCue
-      .filter(c => c.item.tier !== 'cold' || c.cue >= coldFloor)
-      .sort((a, b) => b.cue - a.cue || compareId(a.id, b.id))
+      .filter(c => c.item.tier !== 'cold' || c.cue === undefined || c.cue >= coldFloor)
+      .sort((a, b) => cslsSortKey(b) - cslsSortKey(a) || compareId(a.id, b.id))
       .slice(0, cfg.cslsTopK)
 
     if (ablation === 'csls') {
@@ -126,7 +150,8 @@ export class MemoryRetriever {
       const documents = stages.csls.map(c => c.item.text)
       const scores = await this.reranker.rerank(expandedQuery, documents, opts.signal)
       rerankPool = stages.csls.map((c, i) => ({ ...c, relevance: clamp01(scores[i] ?? 0) }))
-      rerankPool.sort((a, b) => (b.relevance ?? 0) - (a.relevance ?? 0) || compareId(a.id, b.id))
+      rerankPool.sort((a, b) =>
+        ((b.relevance ?? 0) + moodBonus(b)) - ((a.relevance ?? 0) + moodBonus(a)) || compareId(a.id, b.id))
     } catch {
       // 精排失败不致命：降级沿用 cue 序（relevance 缺失，MMR 阶段以 cue 代理）
       rerankPool = [...stages.csls]
@@ -143,12 +168,13 @@ export class MemoryRetriever {
       return finalize(stages.rerank.slice(0, topK))
     }
 
-    // ---- MMR（§3.3）：relevance 用精排分（降级时以 cue 代理），相似度用候选间余弦
+    // ---- MMR（§3.3）：relevance 用精排分（降级时以 cue 代理），相似度用候选间余弦；
+    // 相关性输入加情绪加成（P3-1，与 CSLS/精排截断同一 moodBonus，效果传到最终 top）
     const mmrStage = mmrSelect(
       stages.rerank,
       topK,
       cfg.mmrLambda,
-      c => c.relevance ?? c.cue ?? c.cos,
+      c => (c.relevance ?? c.cue ?? c.cos) + moodBonus(c),
       (a, b) => cosine(a.item.embedding, b.item.embedding),
     )
     stages.mmr = mmrStage

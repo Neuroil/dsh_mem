@@ -28,17 +28,19 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 // 拉入 system-prompt 包的声明合并，使 'system-prompt/assemble' 事件可类型化
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { createEmbeddingProvider, createRerankerProvider } from './embedding.js'
+import { blendMood, decayMood, describeMood, isEmotionEnabled } from './emotion.js'
 import { isConversationMessage } from './intake.js'
 import type { TurnMessage } from './judges.js'
 import { CordisLlm } from './llm.js'
 import { MemoryStore, memoryUnitDescriptor } from './memory-store.js'
 import { createVectorIndex } from './vector-store.js'
 import { buildExpandedQuery, MemoryRetriever } from './retrieval.js'
+import type { RetrieveOptions } from './retrieval.js'
 import { ScoreKeeper } from './scoring.js'
 import { SleepCycle } from './sleep-cycle.js'
 import { ScopeRegistry, scopeKeyOfAgent, scopeKeyOfSession, unitNameFor } from './scope.js'
 import type { Config } from './config.js'
-import type { RetrievalResult } from './types.js'
+import type { MoodState, RetrievalResult } from './types.js'
 import { WritePipeline } from './write-path.js'
 import { createMemoryClearTool, createMemorySearchTool, formatMemories } from './tool.js'
 
@@ -62,6 +64,8 @@ interface SessionState {
   watermark: number
   /** 会话的工作区 scope 键（首事件时由 session.header.cwd 解析，M2）。 */
   scopeKey?: string
+  /** 会话工作区是否在情绪编码白名单内（首事件时解析一次，P3-1）。 */
+  emotionEnabled: boolean
   lastExpandedQuery?: string
   lastResult?: RetrievalResult
 }
@@ -142,6 +146,7 @@ export class MemoryRuntime {
           return {
             retriever: rt.retriever,
             recordRetrieval: (result: RetrievalResult) => void rt.scores.recordRetrieval(result),
+            mood: this.moodContextFor(agent?.session?.header?.cwd, rt),
           }
         },
         recentTurns: (agent) => this.recentTurnsFor(agent),
@@ -257,6 +262,7 @@ export class MemoryRuntime {
           const turn = (event.data as { turn: number }).turn
           const sessionId = session.id
           const scopeKey = state.scopeKey
+          const emotionEnabled = state.emotionEnabled
           // Fire-and-forget: memory consolidation never blocks the turn loop.
           // scope 开启失败（或写入失败）只影响本工作区本轮，日志旁路。
           void (async () => {
@@ -265,6 +271,16 @@ export class MemoryRuntime {
               const outcome = await rt.write.processTurn(sessionId, turn, batch)
               if (outcome.written.length > 0 || outcome.superseded.length > 0) {
                 this.log(`turn ${turn}: wrote ${outcome.written.length}, superseded ${outcome.superseded.length}, dropped ${outcome.dropped}`)
+              }
+              // P3-1 情绪聚合：turn 级观测并入 mood（先按 now 衰减历史值再 EMA）。
+              // 写入管线本身对 mood 无感知；非白名单工作区丢弃观测（读取侧 bypass）。
+              if (emotionEnabled && outcome.turnMood !== undefined) {
+                try {
+                  const next = blendMood(rt.store.getMood(), outcome.turnMood, Date.now(), this.config.emotion.tauHours)
+                  await rt.store.setMood(next)
+                } catch (err) {
+                  this.log('mood blend failed', err)
+                }
               }
               // 睡眠周期触发计数（§5.3：turn/end 信号 + 新记忆量门控，按作用域）
               rt.newSinceSleep += outcome.written.length
@@ -297,12 +313,24 @@ export class MemoryRuntime {
         recent: [],
         pending: [],
         watermark: 0,
-        // scope 键在会话首事件时解析一次（cwd 是创建期元数据，会话期间不变）
+        // scope 键与情绪白名单都在会话首事件时解析一次（cwd 是创建期元数据，会话期间不变）
         scopeKey: scopeKeyOfSession(session, this.config),
+        emotionEnabled: isEmotionEnabled(session.header?.cwd, this.config),
       }
       this.sessions.set(id, state)
     }
     return state
+  }
+
+  /**
+   * 情绪重排上下文（P3-1）：仅白名单工作区；mood 读取时按 τ 惰性衰减
+   * （衰减是投影，不回写——下一次 turn 情绪并入时才前移锚点）。
+   */
+  private moodContextFor(cwd: string | undefined, rt: ScopedRuntime): { state: MoodState; alpha: number } | undefined {
+    if (!isEmotionEnabled(cwd, this.config)) return undefined
+    const mood = rt.store.getMood()
+    if (mood === null) return undefined
+    return { state: decayMood(mood, Date.now(), this.config.emotion.tauHours), alpha: this.config.emotion.alpha }
   }
 
   // ---- automatic channel: agent-scoped prompt assembly (§5.2) ----
@@ -379,26 +407,36 @@ export class MemoryRuntime {
 
     // scope 取自 agent 的会话（首个装配可能先于任何 session/event，此时
     // sessions 里还没有 state——scopeKeyOfAgent 直接读 session.header.cwd）
+    const cwd = agent.session?.header?.cwd
     const rt = await this.scopedFor(scopeKeyOfAgent(agent, this.config))
+    const mood = this.moodContextFor(cwd, rt)
     const recentTurns = (state ? state.recent : []).slice(-this.config.retrieval.contextTurns).map((m) => m.text)
     const expanded = buildExpandedQuery(query, recentTurns, this.config.retrieval.contextTurns)
     // Skip re-running the chain when the expanded query is unchanged within a
     // turn (steps after tool calls re-assemble the prompt).
+    let body: string
     if (!state || state.lastExpandedQuery !== expanded || !state.lastResult) {
       const result = await rt.retriever.retrieve(query, {
         recentTurns,
         signal,
         topK: this.config.section.maxMemories,
-      })
+        ...(mood !== undefined ? { mood } : {}),
+      } satisfies RetrieveOptions)
       void rt.scores.recordRetrieval(result)
       if (state) {
         state.lastResult = result
         state.lastExpandedQuery = expanded
       }
-      return formatMemories(result, this.config.section.maxMemories, this.config.section.header)
+      body = formatMemories(result, this.config.section.maxMemories, this.config.section.header)
+    } else {
+      void rt.scores.recordRetrieval(state.lastResult)
+      body = formatMemories(state.lastResult, this.config.section.maxMemories, this.config.section.header)
     }
-    void rt.scores.recordRetrieval(state.lastResult)
-    return formatMemories(state.lastResult, this.config.section.maxMemories, this.config.section.header)
+    // disclose（P3-1）：仅白名单工作区 + 开关开启 + 已有 mood 时附一行当前心境
+    if (body !== '' && this.config.emotion.disclose && mood !== undefined) {
+      body += `\n${describeMood(mood.state)}`
+    }
+    return body
   }
 
   // ---- offline consolidation cycle ("sleep", §2.3/§5.3) ----
