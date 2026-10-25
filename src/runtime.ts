@@ -29,6 +29,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { createEmbeddingProvider, createRerankerProvider } from './embedding.js'
 import { blendMood, decayMood, describeMood, isEmotionEnabled } from './emotion.js'
+import { graphStats } from './graph.js'
 import { isConversationMessage } from './intake.js'
 import type { TurnMessage } from './judges.js'
 import { CordisLlm } from './llm.js'
@@ -227,6 +228,9 @@ export class MemoryRuntime {
       sleeping: false,
     }
     this.log(`scope opened: unit=${unitName} (${store.validMemories().length} valid memories)`)
+    // P3-2 图密度观测：决定 P3-3 PPR 何时有意义（边数/平均度过低时联想收益有限）
+    const stats = graphStats(store.validMemories(), store.validNodes())
+    this.log(`graph: ${stats.edges} edges over ${stats.items} items (avg degree ${stats.avgDegree.toFixed(2)})`)
     return rt
   }
 

@@ -5,6 +5,7 @@
  * 目标可以是语义节点）→ S 初始化为 imp → 落库并刷新 r_m / red 邻域统计。
  */
 import type { Config } from './config.js'
+import { addRelatedCapped } from './graph.js'
 import {
   epiLexical,
   extractCandidates,
@@ -133,11 +134,12 @@ export class WritePipeline {
         // 压缩归档者）与语义节点（gist）一起送判；记录在前、节点在后，确定性有序
         const neighborRecords = this.deps.store.similar(vector, config.write.contradictionTopK)
           .filter((n) => n.cos >= config.write.contradictionMinCos)
-          .map((n) => ({ id: n.id, text: n.record.text }))
         const neighborNodes = this.deps.store.similarNodes(vector, config.write.contradictionTopK)
           .filter((n) => n.cos >= config.write.contradictionMinCos)
-          .map((n) => ({ id: n.id, text: n.node.gist }))
-        const neighbors = [...neighborRecords, ...neighborNodes]
+        const neighbors = [
+          ...neighborRecords.map((n) => ({ id: n.id, text: n.record.text })),
+          ...neighborNodes.map((n) => ({ id: n.id, text: n.node.gist })),
+        ]
         const judgment = await judgeContradiction(this.deps.llm, text, neighbors, signal)
 
         if (judgment?.verdict === 'duplicate') {
@@ -161,6 +163,19 @@ export class WritePipeline {
         } else if (judgment?.verdict === 'complements') {
           record.links.push({ kind: 'complements', target: judgment.againstId })
         }
+
+        // P3-2 related 边（度数上限内，graph.ts 去重）：
+        // ① 矛盾调用扩产出——判定顺带标注的主题相关近邻（调用次数零增加）；
+        // ② 同义边——余弦 ≥ graph.synonymCos 的近邻（记录与节点按序混排，确定性）。
+        // 主判定目标除外：它已由 verdict 边承载（supersedes/complements），不重复连 related。
+        const mainTarget = judgment?.againstId
+        const relatedTargets = [
+          ...(judgment?.relatedIds ?? []),
+          ...[...neighborRecords, ...neighborNodes]
+            .filter((n) => n.cos >= config.graph.synonymCos && n.id !== mainTarget)
+            .map((n) => n.id),
+        ]
+        record.links = addRelatedCapped(record.links, relatedTargets, config.graph.maxDegree)
 
         await this.deps.store.putRecord(record)
         await this.deps.store.refreshNeighborhood(id, config.retrieval.cslsK)

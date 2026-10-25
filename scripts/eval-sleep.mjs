@@ -78,6 +78,7 @@ const config = {
   tool: { enabled: true, maxResults: 5 },
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
   emotion: { workspaces: [], alpha: 0.15, tauHours: 4, disclose: false },
+  graph: { synonymCos: 0.8, maxDegree: 8 },
 }
 
 // ---- scripted echo LLM: gist/QA/answers derived from the prompt itself ----

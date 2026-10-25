@@ -17,6 +17,7 @@ const config: Config = {
   tool: { enabled: true, maxResults: 5 },
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
   emotion: { workspaces: [], alpha: 0.15, tauHours: 4, disclose: false },
+  graph: { synonymCos: 0.8, maxDegree: 8 },
 }
 
 function makeRecord(over: Partial<MemoryRecord> = {}): MemoryRecord {
@@ -413,7 +414,11 @@ describe('WritePipeline.processTurn 矛盾判定完整版（§2.5，P2）', () =
     const listing = llm.completions[2]!.user // 第三次调用 = 矛盾判定
     expect(listing.split('EXISTING memories:')[1]!.startsWith('\n0. 用户在维护数据库迁移工具')).toBe(true)
     expect(listing).toContain('1. 用户重视数据完整性')
-    expect(outcome.written[0]!.links).toEqual([{ kind: 'complements', target: 'node-1' }])
+    // P3-2：主判定目标建 complements 边；另一近邻 rec-1（cos 0.9 ≥ synonymCos 0.8）顺带建同义 related 边
+    expect(outcome.written[0]!.links).toEqual([
+      { kind: 'complements', target: 'node-1' },
+      { kind: 'related', target: 'rec-1' },
+    ])
   })
 
   it('节点 gist 低于 contradictionMinCos 不送判（安全网阈值对节点同样生效）', async () => {

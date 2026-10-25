@@ -193,7 +193,9 @@ memories (some may be distilled summary statements of older memories).
 Return ONLY a JSON object:
 {"index": <0-based index of the most-related existing memory>,
  "verdict": "contradicts" | "complements" | "duplicate" | "unrelated",
- "temporal": "overlapping" | "disjoint"}
+ "temporal": "overlapping" | "disjoint",
+ "related": [<0-based indices of OTHER existing memories that are topically
+              related to the new one — optional, may be empty or absent>]}
 - "contradicts": the two statements cannot both hold — the old one is superseded.
 - "temporal" (only for "contradicts"): "overlapping" when both make claims about
   the same time frame (present-tense claims included) — only then is the old
@@ -201,7 +203,10 @@ Return ONLY a JSON object:
   (e.g. a past state that has since legitimately changed) — then both stay valid.
 - "complements": they add different facets of the same subject.
 - "duplicate": the new statement adds nothing over the existing one.
-- "unrelated": nothing above applies. No prose.`
+- "unrelated": nothing above applies. "related" is independent of the verdict:
+list there every other existing memory the new one is topically connected to
+(same subject, project, person, or theme), even when the verdict is unrelated.
+No prose.`
 
 const VERDICTS: readonly SupersessionVerdict[] = ['contradicts', 'complements', 'duplicate', 'unrelated']
 
@@ -233,11 +238,19 @@ export async function judgeContradiction(
       }
       if (verdict === 'unrelated') return null
       const temporal = record.temporal
+      // P3-2 扩产出：related 索引列表（宽容解析：非法/越界/缺失按空；不含主判定目标）
+      const related = Array.isArray(record.related)
+        ? record.related
+          .filter((i): i is number =>
+            typeof i === 'number' && Number.isInteger(i) && i >= 0 && i < neighbors.length && i !== index)
+          .map((i) => neighbors[i]!.id)
+        : []
       return {
         verdict,
         againstId: neighbors[index]!.id,
         // 缺省/非法按 overlapping：P0 安全网语义不变（宁软失效不错过取代）
         temporal: verdict === 'contradicts' ? (temporal === 'disjoint' ? 'disjoint' : 'overlapping') : undefined,
+        relatedIds: related,
       }
     },
     signal,

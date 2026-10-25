@@ -25,6 +25,7 @@ const config: Config = {
   tool: { enabled: true, maxResults: 5, clear: false },
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
   emotion: { workspaces: [], alpha: 0.15, tauHours: 4, disclose: false },
+  graph: { synonymCos: 0.8, maxDegree: 8 },
 }
 
 /** 检索器替身：记录调用参数并回放固定结果。 */

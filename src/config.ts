@@ -141,7 +141,7 @@ export interface IntakeConfig {
 export interface EmotionConfig {
   /**
    * 启用情绪编码的工作区白名单（归一化路径精确匹配，同 scope.ts 规则）。
-   * 空列表 = 全部 bypass = 检索行为与无情绪版本恒等（默认）。白名单工作区：
+   * 空列表 = 全部 bypass = 检索行为与无情绪版本逐字节一致（默认）。白名单工作区：
    * mood 状态维护 + CSLS 情绪重排 + 可选披露；写入侧（M5 valence/arousal
    * 落盘）恒开，与白名单无关。
    */
@@ -152,6 +152,14 @@ export interface EmotionConfig {
   tauHours: number
   /** 注入 section 末尾附一行当前心境（仅白名单工作区生效；默认 false）。 */
   disclose: boolean
+}
+
+/** 语义图（P3-2，设计 §10.1）：`related` 边生产参数。 */
+export interface GraphConfig {
+  /** 同义边阈值：写入路径近邻余弦 ≥ 此值自动连 related 边（HippoRAG-2 同义词边参考 0.8）。 */
+  synonymCos: number
+  /** 每条记录 related 边度数上限（防 hub 复发：高度数节点会把 PPR 连成一块饼）。 */
+  maxDegree: number
 }
 
 export interface StorageConfig {
@@ -183,6 +191,7 @@ export interface Config {
   tool: ToolConfig
   intake: IntakeConfig
   emotion: EmotionConfig
+  graph: GraphConfig
 }
 
 const httpModel = (defaults: { endpoint: string; model: string; timeoutMs: number }) =>
@@ -355,4 +364,10 @@ export const Config: Schema<Config> = Schema.object({
     tauHours: Schema.number().min(0.1).default(4),
     disclose: Schema.boolean().default(false),
   }).default({ workspaces: [], alpha: 0.15, tauHours: 4, disclose: false }),
+
+  // 语义图（P3-2）：见 GraphConfig 注释
+  graph: Schema.object({
+    synonymCos: Schema.percent().default(0.8),
+    maxDegree: Schema.natural().min(1).default(8),
+  }).default({ synonymCos: 0.8, maxDegree: 8 }),
 })

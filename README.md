@@ -355,7 +355,7 @@ turn/end 信号门控触发（自上次周期新写入 ≥ `sleep.minNewMemories
 |---|---|
 | `src/` | 插件源码（模块地图见[开发](#开发)） |
 | `lib/` | `npm run build` 产物（ESM + .d.ts） |
-| `tests/` | 238 个离线单测（vitest，无需网络与 API key） |
+| `tests/` | 243 个离线单测（vitest，无需网络与 API key） |
 | `scripts/eval-ndcg.mjs` | §7.1 检索四档消融脚手架 |
 | `scripts/eval-sleep.mjs` | P1 睡眠周期脚手架（QA 保留率、压缩后召回存续） |
 | `scripts/eval-semtime.mjs` | P2 语义 vs 时间消融脚手架（§7.4 关键消融 + 时间旅行） |
@@ -511,6 +511,7 @@ src/
 | `storage.backend` / `unit` / `version` / `workspaceScope`(true) | KV 后端名（json/sqlite）、unit 名前缀与无 cwd 回退名（**不含连字符**，规则同宿主 `/^[a-z][a-z0-9_]*$/`，连字符会被归一为下划线）、格式版本、按工作区一区一库开关（false = 全局单库旧行为；工作区 unit 名 = `<unit>_ws_<路径哈希>`） |
 | `intake.session.enabled`(true) / `acceptSourceKinds`(['user']) | 会话历史入口：停写开关（检索不受影响）与"什么算人类输入"的 source.kind 白名单（IM 适配器自定义 kind 加进列表即可；带 `form` 的插件上下文恒不算对话） |
 | `emotion.workspaces`(**[]**) / `alpha`(0.15≤0.2) / `tauHours`(4) / `disclose`(false) | 按工作区的情绪编码（P3-1）：白名单（归一化路径精确匹配，空=全部 bypass 恒等）、情绪重排权重（只进语义筛选后的排序键，cold 门控/L0 召回纯语义）、mood 衰减常数、心境披露开关 |
+| `graph.synonymCos`(0.8) / `maxDegree`(8) | 语义图 related 边（P3-2）：同义边余弦阈值与每记录度数上限（聚类建边 + 矛盾调用扩产出 + 同义边三件套） |
 | `embedding.*` | mode(http/deterministic)、endpoint、model、apiKey、dimensions(1024)、batchSize——endpoint 出厂默认 SiliconFlow；本地 llama.cpp 为 `http://127.0.0.1:8080/v1/embeddings`（见「推荐：本地部署 llama.cpp」） |
 | `reranker.*` | 同上（无 dimensions；本地 llama.cpp 为 `http://127.0.0.1:8081/v1/rerank`） |
 | `llm.provider` / `model` / `temperature`(0) / `maxTokens` | 内部判分调用（经 ctx.llm） |

@@ -18,6 +18,7 @@
  * 不依赖宿主框架，可离线单测。
  */
 import type { Config } from './config.js'
+import { addRelatedCapped } from './graph.js'
 import {
   answerFromGist,
   extractGist,
@@ -409,16 +410,20 @@ export class SleepCycle {
     return id
   }
 
-  /** §2.3 第 6 步：成员压缩归档 —— 指向 gist、记录归档时点（时间旅行视图消费）、退出检索，仅保留回溯索引。 */
+  /** §2.3 第 6 步：成员压缩归档 —— 指向 gist、记录归档时点（时间旅行视图消费）、退出检索，仅保留回溯索引。
+   *  P3-2：同簇成员顺带互连 related 边（pairwise 余弦已由聚类算得——同簇即语义近邻，边免费；
+   *  度数上限内、按 id 序确定性消费额度）。成员↔节点的边由 member_refs 承载，不另建。 */
   private async compressMembers(
     memberIds: readonly string[],
     nodeId: string,
     routeKind: 'new_node' | 'attached',
     at: number,
   ): Promise<void> {
-    for (const id of memberIds) {
+    const sorted = [...memberIds].sort()
+    for (const id of sorted) {
       await this.deps.store.updateRecord(id, (r) => ({
         ...r,
+        links: addRelatedCapped(r.links, sorted.filter((mate) => mate !== id), this.deps.config.graph.maxDegree),
         time_meta: { ...r.time_meta, compressed_at: at },
         flags: { ...r.flags, compressed_into: nodeId, qa_passed: true },
         con_route:

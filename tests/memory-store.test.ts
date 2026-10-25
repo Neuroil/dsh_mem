@@ -25,6 +25,7 @@ const testConfig = (): Config => ({
   tool: { enabled: true, maxResults: 5, clear: false },
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
   emotion: { workspaces: [], alpha: 0.15, tauHours: 4, disclose: false },
+  graph: { synonymCos: 0.8, maxDegree: 8 },
 })
 
 /** 全字段 MemoryRecord（对照 types.ts；r_m/red/epi 为 0，con_route pending，counters 全 0）。 */

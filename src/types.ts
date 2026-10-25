@@ -262,4 +262,9 @@ export interface ContradictionJudgment {
   readonly againstId: string
   /** 仅 verdict === 'contradicts' 时有意义：时间重叠才软失效（§2.5 完整版）。 */
   readonly temporal?: TemporalOverlap
+  /**
+   * P3-2 扩产出：同一次调用顺带标注的「主题相关」近邻 id（不含主判定目标），
+   * 写入路径据此建 related 边（度数上限内）；宽容解析，缺失/非法为空。
+   */
+  readonly relatedIds?: readonly string[]
 }

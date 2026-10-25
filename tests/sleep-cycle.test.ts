@@ -47,6 +47,7 @@ const BASE_CONFIG: Config = {
   tool: { enabled: true, maxResults: 5 },
   intake: { session: { enabled: true, acceptSourceKinds: ['user'] } },
   emotion: { workspaces: [], alpha: 0.15, tauHours: 4, disclose: false },
+  graph: { synonymCos: 0.8, maxDegree: 8 },
 }
 
 /** 覆写 sleep 段超参（其余段沿用 BASE_CONFIG）。 */
@@ -396,6 +397,11 @@ describe('SleepCycle.run', () => {
       const r = store.records.get(id)!
       expect(r.flags).toEqual({ compressed_into: 'node-1', qa_passed: true })
       expect(r.con_route).toEqual({ kind: 'new_node', nodeId: 'node-1' })
+      // P3-2 聚类建边：同簇成员互连 related（3 成员簇，每人 2 条，远低于度数上限）
+      const mates = ['m1', 'm2', 'm3'].filter((m) => m !== id)
+      expect(r.links.filter((l) => l.kind === 'related')).toEqual(
+        mates.map((m) => ({ kind: 'related', target: m })),
+      )
     }
 
     expect(outcome.refreshedRecords).toBe(0) // 全部被压缩，退出检索宇宙
