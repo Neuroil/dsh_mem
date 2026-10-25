@@ -395,6 +395,7 @@ export class MemoryStore {
       layer: 'episodic',
       valence: record.valence,
       arousal: record.arousal,
+      neighbors: [...new Set(record.links.map((l) => l.target))],
     }
   }
 
@@ -408,6 +409,7 @@ export class MemoryStore {
       tier: tierOf(node.S, this.config.tier),
       createdAt: node.time_meta.created_at,
       layer: 'semantic',
+      neighbors: [...new Set([...node.links.map((l) => l.target), ...node.member_refs])],
     }
   }
 

@@ -22,7 +22,8 @@
     "eval:ndcg": "node scripts/eval-ndcg.mjs",
     "eval:sleep": "node scripts/eval-sleep.mjs",
     "eval:semtime": "node scripts/eval-semtime.mjs",
-    "eval:emotion": "node scripts/eval-emotion.mjs"
+    "eval:emotion": "node scripts/eval-emotion.mjs",
+    "eval:multihop": "node scripts/eval-multihop.mjs"
   },
   "keywords": [
     "dsh",

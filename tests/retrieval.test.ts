@@ -33,6 +33,9 @@ function makeConfig(overrides: Partial<RetrievalConfig> = {}): RetrievalConfig {
     contextTurns: 3,
     coldCueBoost: 0.1,
     cueThreshold: 0.3,
+    pprSeedK: 8,
+    pprDamping: 0.5,
+    pprWeight: 0.2,
     ...overrides,
   }
 }
@@ -47,6 +50,7 @@ function makeItem(init: {
   layer?: 'episodic' | 'semantic'
   valence?: number
   arousal?: number
+  neighbors?: readonly string[]
 }): RetrievableItem {
   return {
     id: init.id,
@@ -58,6 +62,7 @@ function makeItem(init: {
     layer: init.layer ?? 'episodic',
     ...(init.valence !== undefined ? { valence: init.valence } : {}),
     ...(init.arousal !== undefined ? { arousal: init.arousal } : {}),
+    ...(init.neighbors !== undefined ? { neighbors: init.neighbors } : {}),
   }
 }
 
@@ -563,4 +568,87 @@ describe('CSLS 情绪重排（P3-1：只进排序键，不进召回与 cold 门�
   function zeroReranker(): RerankerProvider {
     return { rerank: async (_q, docs) => docs.map(() => 0) }
   }
+})
+
+// ---------- P3-3 确定性联想（PPR） ----------
+
+describe('PPR 确定性联想（P3-3：只重排不召回，cold 门控与 L0 纯语义）', () => {
+  /**
+   * 多跳夹具：查询只与 A 语义相近；A—B—C 链把 PPR 质量导向 C；
+   * D 直接余弦略高于 C 但不在图上。
+   *   cos：A 0.9 / B 0.2 / D 0.18 / C 0.15，r_m 均 0.1
+   *   r(q) = 1.43/4 = 0.3575 → cue：A 1.3425 / B −0.0575 / D −0.0975 / C −0.1575
+   *   PPR（种子 = L0 top-1 = A，damping 0.8）稳态：A 17/45 / B 4/9 / C 8/45
+   *   pprWeight 0.5 加成后 C(−0.069) 反超 D(−0.098) —— 多跳抬进 top-3
+   */
+  function multiHopFixture(): RetrievableItem[] {
+    return [
+      makeItem({ id: 'A', text: 'A', embedding: unitByX(0.9), neighbors: ['B'] }),
+      makeItem({ id: 'B', text: 'B', embedding: unitByX(0.2), neighbors: ['A', 'C'] }),
+      makeItem({ id: 'C', text: 'C', embedding: unitByX(0.15), neighbors: ['B'] }),
+      makeItem({ id: 'D', text: 'D', embedding: unitByX(0.18) }),
+    ]
+  }
+
+  function multiHopVectors(): Record<string, readonly number[]> {
+    return {
+      [QUERY]: QVEC,
+      A: unitByX(0.9), B: unitByX(0.2), C: unitByX(0.15), D: unitByX(0.18),
+    }
+  }
+
+  const pprOn: Partial<RetrievalConfig> = { pprSeedK: 1, pprDamping: 0.8, pprWeight: 0.5 }
+
+  it('多跳：C 经 A-B-C 边被 PPR 抬进 top，直接余弦更高的 D 落选', async () => {
+    const { retriever } = makeRetriever({ items: multiHopFixture(), vectors: multiHopVectors(), config: pprOn })
+    const result = await retriever.retrieve(QUERY, { ablation: 'csls', topK: 3 })
+    // 无 PPR 时序为 A, B, D, C；PPR 加成把 C 从链上邻居处拉到 D 之前
+    expect(ids(result.top)).toEqual(['A', 'B', 'C'])
+  })
+
+  it('PPR 关闭（pprWeight=0）时同一夹具回到纯 cue 序：C 落榜', async () => {
+    const { retriever } = makeRetriever({ items: multiHopFixture(), vectors: multiHopVectors(), config: { pprWeight: 0 } })
+    const result = await retriever.retrieve(QUERY, { ablation: 'csls', topK: 3 })
+    expect(ids(result.top)).toEqual(['A', 'B', 'D'])
+  })
+
+  it('只重排不召回：L0 之外的项不可被联想拉入（l0TopK=2 时 C 不出现）', async () => {
+    const { retriever } = makeRetriever({ items: multiHopFixture(), vectors: multiHopVectors(), config: { ...pprOn, l0TopK: 2 } })
+    const result = await retriever.retrieve(QUERY, { ablation: 'csls', topK: 4 })
+    // L0 = [A, B]；C 虽在图上且 PPR 分数非零，但不在 L0 池内——不可召回
+    expect(ids(result.top)).toEqual(['A', 'B'])
+  })
+
+  it('图无边时与无 PPR 版本逐字节恒等（pprScore 精确跳过）', async () => {
+    const noGraph = multiHopFixture().map(item => makeItem({ id: item.id, text: item.text, embedding: item.embedding }))
+    const withPpr = makeRetriever({ items: noGraph, vectors: multiHopVectors(), config: pprOn })
+    const without = makeRetriever({ items: noGraph, vectors: multiHopVectors(), config: { pprWeight: 0 } })
+    const on = await withPpr.retriever.retrieve(QUERY)
+    const off = await without.retriever.retrieve(QUERY)
+    expect(ids(on.top)).toEqual(ids(off.top))
+    expect(ids(on.stages.csls)).toEqual(ids(off.stages.csls))
+    expect(ids(on.stages.mmr)).toEqual(ids(off.stages.mmr))
+  })
+
+  it('cold 门控用纯 cue：cold 项不得凭 PPR 加成混过门槛', async () => {
+    const items = [
+      makeItem({ id: 'cold-hop', text: 'coldHop', embedding: unitByX(0.9), tier: 'cold', r_m: 0.9, neighbors: ['warm-plain'] }),
+      makeItem({ id: 'warm-plain', text: 'warm', embedding: unitByX(0.5), r_m: 0.1 }),
+    ]
+    const vectors: Record<string, readonly number[]> = {
+      [QUERY]: QVEC, 'cold-hop': unitByX(0.9), 'warm-plain': unitByX(0.5),
+    }
+    // coldFloor 抬到纯 cue 永远过不了的高度：cold 项即使 PPR 分数最高也必须被滤掉
+    const { retriever } = makeRetriever({ items, vectors, config: { ...pprOn, cueThreshold: 10 } })
+    const result = await retriever.retrieve(QUERY, { ablation: 'csls' })
+    expect(ids(result.stages.csls)).toEqual(['warm-plain'])
+  })
+
+  it('确定性：同输入两次检索结果逐 id 相等', async () => {
+    const { retriever } = makeRetriever({ items: multiHopFixture(), vectors: multiHopVectors(), config: pprOn })
+    const first = await retriever.retrieve(QUERY, { ablation: 'csls', topK: 4 })
+    const second = await retriever.retrieve(QUERY, { ablation: 'csls', topK: 4 })
+    expect(ids(first.top)).toEqual(ids(second.top))
+    expect(first.top.map(c => c.cue)).toEqual(second.top.map(c => c.cue))
+  })
 })

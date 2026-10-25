@@ -58,6 +58,11 @@ const config = {
     contextTurns: 0,
     coldCueBoost: 0.1,
     cueThreshold: 0.3,
+    // PPR 默认与 src/config.ts 一致；本脚本的合成语料 links 恒空 → 图无边，
+    // PPR 精确跳过（喂带 links 的语料即可测联想档）
+    pprSeedK: 8,
+    pprDamping: 0.5,
+    pprWeight: 0.2,
   },
   tier: { hotThreshold: 8, coldThreshold: 2 },
 }

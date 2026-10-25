@@ -355,7 +355,7 @@ turn/end 信号门控触发（自上次周期新写入 ≥ `sleep.minNewMemories
 |---|---|
 | `src/` | 插件源码（模块地图见[开发](#开发)） |
 | `lib/` | `npm run build` 产物（ESM + .d.ts） |
-| `tests/` | 243 个离线单测（vitest，无需网络与 API key） |
+| `tests/` | 257 个离线单测（vitest，无需网络与 API key） |
 | `scripts/eval-ndcg.mjs` | §7.1 检索四档消融脚手架 |
 | `scripts/eval-sleep.mjs` | P1 睡眠周期脚手架（QA 保留率、压缩后召回存续） |
 | `scripts/eval-semtime.mjs` | P2 语义 vs 时间消融脚手架（§7.4 关键消融 + 时间旅行） |
@@ -471,12 +471,31 @@ time-anchored queries: 1 (resurfaced relevant ids via time travel: 1)
 - `resurfaced`：时间旅行查询中，"当前视图已不可见（被软失效）但该时点有效"的相关记忆数——支柱五完整版的直接演示（示例数据里 2026-06 的 MySQL 记忆在 6 月时点重新可检索，而 8 月切换到 PostgreSQL 之后它被取代）；
 - 验收目标：真实端点与真实标注下 semantic 显著优于两个时间 baseline（尤其"十年前的原则 > 一分钟前的闲聊"类查询）；LoCoMo 式端到端回放需活宿主 + 真实 LLM，见上文"尚未验证"。
 
+## 评测：多跳联想 ±PPR（P3-3，设计 §10.1）
+
+HippoRAG 式多跳验证：合成链式语料（每链 锚点—桥—目标，以共享词袋连接 related 边），**目标记录与查询零共享词**——直接余弦 ≈ 0，只能经图上两跳被 PPR 召回。
+
+```sh
+npm run build
+npm run eval:multihop                          # --chains/--distractors/--topk/--ppr-weight 可调
+```
+
+deterministic 冒烟输出（度量排序行为，无语义意义）：
+
+```
+chains=30 distractors=60 top-5 pprWeight=0.2 (seedK=8 damping=0.5；deterministic 嵌入)
+纯语义（pprWeight=0）: recall@5 = 3.3%，命中均值排名 = 2.0，未命中 29
+PPR 联想（pprWeight=0.2）: recall@5 = 100.0%，命中均值排名 = 2.0，未命中 0
+```
+
+纯语义臂的 3.3% 是哈希碰撞噪声（deterministic 嵌入偶发同桶）；PPR 臂把两跳外的目标全部抬进 top-5。真实语料上收益取决于图密度（作用域开启日志有 `graph: N edges over M items` 一行可观察）。
+
 ## 开发
 
 ```sh
 npm install
 npm run typecheck                          # tsc --noEmit
-npm test                                   # vitest run（全部 211 个）
+npm test                                   # vitest run（全部 257 个）
 npx vitest run tests/sleep-cycle.test.ts   # 单文件
 npm run build                              # 产出 lib/
 ```
@@ -488,16 +507,20 @@ src/
   index.ts        插件入口（具名导出 name/inject/Config/apply；inject: storage,llm,tools,systemPrompt,sessions）
   config.ts       全超参 Config schema（Schemastery，默认值在 schema，无硬编码可调参数）
   types.ts        数据模型与共享接口（MemoryRecord/SemanticNode/ScoreCounters/RetrievableItem/Provider 接口）
-  memory-store.ts ctx.storage KV 仓库 + 记录/节点软失效 + 检索宇宙与时间旅行视图 + 邻域统计（r_m/red）
+  memory-store.ts ctx.storage KV 仓库 + 记录/节点软失效 + 检索宇宙与时间旅行视图 + 邻域统计（r_m/red）+ mood 槽
   metrics.ts      cosine / CSLS / MMR / z 标准化 / sigmoid / QA-F1 纯函数
   vector-store.ts 精确 kNN 索引（P0 规模；接口留出 ANN 余地）
-  retrieval.ts    四级检索管线 + 消融档（base/csls/rerank/full；L0 池 = 未压缩记录 + 语义节点；at 时间旅行选项）
+  scope.ts        工作区作用域（M2：cwd 归一化哈希 → unit 名派生；fnv1a）
+  intake.ts       会话历史入口守卫（M3：source.kind 白名单 + form 守卫）
+  retrieval.ts    四级检索管线 + 消融档（base/csls/rerank/full；L0 池 = 未压缩记录 + 语义节点；at 时间旅行；mood/PPR 排序加成）
+  graph.ts        语义图边工具（P3-2：去重/度数上限/密度统计）+ 邻接构建与 PPR 幂迭代（P3-3）
+  emotion.ts      情绪编码（P3-1：白名单判定、moodSim/衰减/EMA 融合、disclose 文案）
   embedding.ts    嵌入/重排客户端（OpenAI 兼容 /embeddings、/rerank；deterministic 离线替身）
   llm.ts          内部 LLM 调用（ctx.llm 流服务 + BlockAssembler；适配器失败按终态 error/aborted 块识别）
   judges.ts       候选抽取 / M5 判分 / 矛盾判定（含 temporal 重叠）/ epi 词法 / gist 抽取 / QA 生成与作答 / M4 兼容复核（JSON 健壮解析 + 重试一次）
   scoring.ts      支柱一 S 完整动态（§2.1）：使用/抑制事件、arousal 乘法门、惰性兜底衰减、tier 跃迁 + M5 EMA 重判（ScoreKeeper）
   write-path.ts   写入管线（§5.1 七步 + §2.5 完整版：时间重叠闸 + 语义节点软失效；单候选失败不中断整轮）
-  sleep-cycle.ts  睡眠巩固周期（§2.3 七步 + 第 7 步 S 兜底衰减；迁移带 compressed_at 归档时点）
+  sleep-cycle.ts  睡眠巩固周期（§2.3 七步 + 第 7 步 S 兜底衰减；迁移带 compressed_at 归档时点 + 同簇建边）
   runtime.ts      编排：会话观察、agent 定域自动注入、ScoreKeeper 记账接线、睡眠周期触发
   tool.ts         memory_search 工具（含 at 时间旅行参数）+ memory_clear（开发/测试硬删除，默认关）+ section 文本渲染
 ```
@@ -516,7 +539,7 @@ src/
 | `reranker.*` | 同上（无 dimensions；本地 llama.cpp 为 `http://127.0.0.1:8081/v1/rerank`） |
 | `llm.provider` / `model` / `temperature`(0) / `maxTokens` | 内部判分调用（经 ctx.llm） |
 | `write.messageWindow`(10) / `maxCandidates`(8) / `minImportance`(3) / `contradictionTopK`(5) / `contradictionMinCos`(0.8) | 写入路径 |
-| `retrieval.l0TopK`(100) / `cslsTopK`(20) / `rerankTopK`(8) / `mmrTopK`(5) / `mmrLambda`(0.6) / `cslsK`(10) / `contextTurns`(3) / `coldCueBoost`(0.1) / `cueThreshold`(0.3) | 检索链路 |
+| `retrieval.l0TopK`(100) / `cslsTopK`(20) / `rerankTopK`(8) / `mmrTopK`(5) / `mmrLambda`(0.6) / `cslsK`(10) / `contextTurns`(3) / `coldCueBoost`(0.1) / `cueThreshold`(0.3) / `pprSeedK`(8) / `pprDamping`(0.5) / `pprWeight`(0.2) | 检索链路；ppr 三键（P3-3）= 确定性联想：L0 top-N 为种子在语义图上跑 PPR、分数只进排序键（不进召回与 cold 门控），`pprWeight`=0 关闭、图无边时自动跳过 |
 | `tier.hotThreshold`(8) / `coldThreshold`(2) | 分层（S ≥ 8 hot，S < 2 cold） |
 | `score.useGain`(0.5) / `suppressPenalty`(0.05) / `decayTauDays`(180) / `rejudgeEma`(0.5) | 支柱一 S 动态（§2.1）：使用增益 α / 抑制惩罚 ε / 兜底衰减 τ（天）/ 跃迁重判 EMA 权重 |
 | `sleep.enabled` / `minNewMemories`(10) | 睡眠周期开关与触发阈值（新写入计数） |

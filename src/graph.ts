@@ -50,3 +50,87 @@ export function graphStats(
   const items = records.length + nodes.length
   return { items, edges, avgDegree: items === 0 ? 0 : (2 * edges) / items }
 }
+
+// ---- P3-3：邻接构建与 PPR ----
+
+/** 池内项的最小结构（RetrievableItem 满足；neighbors = links 目标 + 节点 member_refs）。 */
+export interface AdjacentItem {
+  readonly id: string
+  /** 邻居 id 列表（可能含池外/软失效 id——构建时过滤）。 */
+  readonly neighbors?: readonly string[]
+}
+
+/**
+ * 无向邻接表：只连**池内**的边（池 = 检索宇宙：有效未压缩记录 + 有效节点；
+ * 软失效/归档出池的 id 自动被 `ids.has` 过滤，图遍历天然不越池）。
+ */
+export function buildAdjacency(items: readonly AdjacentItem[]): Map<string, Set<string>> {
+  const ids = new Set(items.map((i) => i.id))
+  const adjacency = new Map<string, Set<string>>()
+  for (const item of items) adjacency.set(item.id, new Set<string>())
+  for (const item of items) {
+    const own = adjacency.get(item.id)!
+    for (const target of item.neighbors ?? []) {
+      if (target === item.id || !ids.has(target)) continue
+      own.add(target)
+      adjacency.get(target)!.add(item.id)
+    }
+  }
+  return adjacency
+}
+
+/**
+ * Personalized PageRank（幂迭代，确定性：Map 按插入序遍历）。
+ * seed 权重归一化为分布；悬挂质量均匀回撒；收敛于容差或 maxIterations。
+ * 返回空 Map 当且仅当图为空或 seed 全不在图中（调用方据此精确跳过 PPR）。
+ */
+export function personalizedPagerank(
+  adjacency: ReadonlyMap<string, ReadonlySet<string>>,
+  seeds: ReadonlyMap<string, number>,
+  damping: number,
+  maxIterations = 20,
+  tolerance = 1e-8,
+): Map<string, number> {
+  const nodes = [...adjacency.keys()]
+  const seedTotal = [...seeds.values()].reduce((a, b) => a + b, 0)
+  const result = new Map<string, number>()
+  if (nodes.length === 0 || seedTotal <= 0) return result
+  const seedDist = new Map<string, number>()
+  let inGraph = 0
+  for (const n of nodes) seedDist.set(n, 0)
+  for (const [id, weight] of seeds) {
+    if (seedDist.has(id)) {
+      seedDist.set(id, weight / seedTotal)
+      inGraph += weight / seedTotal
+    }
+  }
+  if (inGraph <= 0) return result
+  let rank = new Map(seedDist)
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
+    const next = new Map<string, number>()
+    for (const n of nodes) next.set(n, 0)
+    let dangling = 0
+    for (const n of nodes) {
+      const current = rank.get(n)!
+      const out = adjacency.get(n)!
+      if (out.size === 0) {
+        dangling += current
+        continue
+      }
+      const share = current / out.size
+      for (const neighbor of out) next.set(neighbor, next.get(neighbor)! + share)
+    }
+    const danglingShare = dangling / nodes.length
+    let delta = 0
+    for (const n of nodes) {
+      const value =
+        (1 - damping) * (seedDist.get(n) ?? 0) +
+        damping * ((next.get(n) ?? 0) + danglingShare)
+      next.set(n, value)
+      delta += Math.abs(value - rank.get(n)!)
+    }
+    rank = next
+    if (delta < tolerance) break
+  }
+  return rank
+}

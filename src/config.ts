@@ -60,6 +60,12 @@ export interface RetrievalConfig {
   coldCueBoost: number
   /** Base CSLS cue floor; only cold-tier gating consumes it in P0. */
   cueThreshold: number
+  /** P3-3 确定性联想：PPR 种子数（L0 top-N 作种子；0 = 关闭）。 */
+  pprSeedK: number
+  /** P3-3：PPR damping（HippoRAG-2 参考 0.5）。 */
+  pprDamping: number
+  /** P3-3：PPR 分数加成权重（只进排序键，不进召回与 cold 门控；图无边时精确跳过）。 */
+  pprWeight: number
 }
 
 export interface TierConfig {
@@ -283,6 +289,9 @@ export const Config: Schema<Config> = Schema.object({
     contextTurns: Schema.natural().min(0).default(3),
     coldCueBoost: Schema.number().min(0).max(1).default(0.1),
     cueThreshold: Schema.number().min(-2).max(2).default(0.3),
+    pprSeedK: Schema.natural().default(8),
+    pprDamping: Schema.percent().default(0.5),
+    pprWeight: Schema.number().min(0).default(0.2),
   }).default({
     l0TopK: 100,
     cslsTopK: 20,
@@ -293,6 +302,9 @@ export const Config: Schema<Config> = Schema.object({
     contextTurns: 3,
     coldCueBoost: 0.1,
     cueThreshold: 0.3,
+    pprSeedK: 8,
+    pprDamping: 0.5,
+    pprWeight: 0.2,
   }),
 
   tier: Schema.object({

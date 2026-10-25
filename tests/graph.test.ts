@@ -1,9 +1,10 @@
 /**
  * 语义图边工具（P3-2）单测：去重追加、度数上限、密度统计。
+ * P3-3 增：邻接构建（池外过滤/无向对称）与 PPR（手算链/归一化/边界/确定性）。
  */
 import { describe, expect, it } from 'vitest'
-import { addLink, addRelatedCapped, graphStats, relatedDegree } from '../src/graph.js'
-import type { MemoryLink, MemoryRecord, SemanticNode } from '../src/types.js'
+import { addLink, addRelatedCapped, buildAdjacency, graphStats, personalizedPagerank, relatedDegree } from '../src/graph.js'
+import type { AdjacentItem, MemoryLink, MemoryRecord, SemanticNode } from '../src/types.js'
 
 const record = (id: string, links: MemoryLink[]): MemoryRecord => ({
   id, text: `t-${id}`, embedding: [1, 0],
@@ -62,5 +63,80 @@ describe('graphStats（密度统计）', () => {
 
   it('空图返回 0 且不除零', () => {
     expect(graphStats([], [])).toEqual({ items: 0, edges: 0, avgDegree: 0 })
+  })
+})
+
+describe('buildAdjacency（P3-3 邻接构建）', () => {
+  const item = (id: string, neighbors: string[]): AdjacentItem => ({ id, neighbors })
+
+  it('无向对称：任一侧声明都双向连通', () => {
+    const adjacency = buildAdjacency([item('a', ['b']), item('b', []), item('c', [])])
+    expect([...adjacency.get('a')!]).toEqual(['b'])
+    expect([...adjacency.get('b')!]).toEqual(['a'])
+    expect(adjacency.get('c')!).toEqual(new Set())
+  })
+
+  it('池外与自环 id 被过滤（软失效/归档出池后图遍历不越池）', () => {
+    const adjacency = buildAdjacency([item('a', ['gone', 'a', 'b']), item('b', [])])
+    expect([...adjacency.get('a')!]).toEqual(['b'])
+    expect(adjacency.has('gone')).toBe(false)
+  })
+
+  it('空池返回空 Map', () => {
+    expect(buildAdjacency([])).toEqual(new Map())
+  })
+})
+
+describe('personalizedPagerank（P3-3，幂迭代）', () => {
+  /** A—B—C 路径图（A 为唯一种子）的邻接表。 */
+  function pathABC(): Map<string, Set<string>> {
+    return buildAdjacency([
+      { id: 'A', neighbors: ['B'] },
+      { id: 'B', neighbors: ['A', 'C'] },
+      { id: 'C', neighbors: ['B'] },
+    ])
+  }
+
+  it('A-B-C 链、damping 0.5、种子 A：收敛到解析稳态 7/12 / 1/3 / 1/12', () => {
+    // 稳态方程：r = 0.5·seed + 0.5·W·r → r(B)=1/3、r(A)=7/12、r(C)=1/12
+    const rank = personalizedPagerank(pathABC(), new Map([['A', 1]]), 0.5, 100, 1e-12)
+    expect(rank.get('A')).toBeCloseTo(7 / 12, 6)
+    expect(rank.get('B')).toBeCloseTo(1 / 3, 6)
+    expect(rank.get('C')).toBeCloseTo(1 / 12, 6)
+  })
+
+  it('种子权重归一化为分布：{A:2,B:1} 与 {A:2/3,B:1/3} 结果一致；总质量守恒为 1', () => {
+    const twoSeeds = personalizedPagerank(pathABC(), new Map([['A', 2], ['B', 1]]), 0.5, 100, 1e-12)
+    const normalized = personalizedPagerank(pathABC(), new Map([['A', 2 / 3], ['B', 1 / 3]]), 0.5, 100, 1e-12)
+    for (const id of ['A', 'B', 'C']) {
+      expect(twoSeeds.get(id)).toBeCloseTo(normalized.get(id)!, 10)
+    }
+    const total = [...twoSeeds.values()].reduce((a, b) => a + b, 0)
+    expect(total).toBeCloseTo(1, 8)
+  })
+
+  it('悬挂质量回撒：孤立节点的质量不丢失（总和仍为 1）', () => {
+    const adjacency = buildAdjacency([
+      { id: 'A', neighbors: ['B'] },
+      { id: 'B', neighbors: [] },
+      { id: 'C', neighbors: [] }, // C 完全孤立（无向图里 A-B 仍连通）：度数 0，质量走回撒
+    ])
+    const rank = personalizedPagerank(adjacency, new Map([['A', 1]]), 0.5, 100, 1e-12)
+    const total = [...rank.values()].reduce((a, b) => a + b, 0)
+    expect(total).toBeCloseTo(1, 8)
+    expect(rank.size).toBe(3)
+  })
+
+  it('空图或种子全不在图中返回空 Map（调用方据此精确跳过 PPR）', () => {
+    expect(personalizedPagerank(new Map(), new Map([['A', 1]]), 0.5)).toEqual(new Map())
+    expect(personalizedPagerank(pathABC(), new Map([['X', 1]]), 0.5)).toEqual(new Map())
+    // 种子权重非正同样视为无种子
+    expect(personalizedPagerank(pathABC(), new Map([['A', 0]]), 0.5)).toEqual(new Map())
+  })
+
+  it('确定性：同输入同输出（Map 按插入序遍历，无迭代顺序抖动）', () => {
+    const first = personalizedPagerank(pathABC(), new Map([['A', 1]]), 0.5)
+    const second = personalizedPagerank(pathABC(), new Map([['A', 1]]), 0.5)
+    expect([...first.entries()]).toEqual([...second.entries()])
   })
 })

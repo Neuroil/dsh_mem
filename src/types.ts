@@ -30,6 +30,8 @@ export interface RetrievableItem {
   /** M5 情绪判分（仅情景记录；语义节点已去情境化，恒 undefined）。P3-1 情绪重排消费。 */
   readonly valence?: number
   readonly arousal?: number
+  /** 图邻居 id（去重：links 目标 + 节点 member_refs；池外 id 由 buildAdjacency 过滤）。P3-3 PPR 消费。 */
+  readonly neighbors?: readonly string[]
 }
 
 /** M5 structured rubric verdict for one memory (§3.5). */

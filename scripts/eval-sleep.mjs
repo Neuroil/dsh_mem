@@ -57,6 +57,7 @@ const config = {
   retrieval: {
     l0TopK: 100, cslsTopK: 20, rerankTopK: 8, mmrTopK: 5, mmrLambda: 0.6,
     cslsK: 10, contextTurns: 0, coldCueBoost: 0.1, cueThreshold: 0.3,
+    pprSeedK: 8, pprDamping: 0.5, pprWeight: 0.2,
   },
   tier: { hotThreshold: 8, coldThreshold: 2 },
   score: { useGain: 0.5, suppressPenalty: 0.05, decayTauDays: 180, rejudgeEma: 0.5 },
